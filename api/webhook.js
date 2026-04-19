@@ -2,11 +2,13 @@ const OWNER_CHAT_ID = 696698928
 const BOT_TOKEN = process.env.BOT_TOKEN
 
 async function sendMessage(chatId, text, options = {}) {
-  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown', ...options }),
   })
+  const data = await res.json()
+  console.log('sendMessage result:', JSON.stringify(data))
 }
 
 module.exports = async (req, res) => {
