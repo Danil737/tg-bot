@@ -38,27 +38,24 @@ function buildContactButtons(contact, name) {
   }
 
   // Phone: extract digits, normalize to E.164 (+7… for Russia)
+  // Note: Telegram inline-buttons do NOT support tel: URLs (only http/https/tg).
+  // The phone number itself is auto-linked in the message text — long-press in TG
+  // gives a "Call / Copy" menu. So we only add a WhatsApp button here.
   const digits = trimmed.replace(/[^\d]/g, '')
   if (digits.length >= 10 && digits.length <= 15) {
     let e164
     if (digits.length === 11 && digits.startsWith('8')) e164 = '+7' + digits.slice(1)
     else if (digits.length === 10) e164 = '+7' + digits
-    else if (trimmed.startsWith('+')) e164 = '+' + digits
-    else e164 = '+' + digits
+    else e164 = (trimmed.startsWith('+') ? '+' : '+') + digits
     const greeting = `Здравствуйте, ${name || 'это'}! УходМогил по вашей заявке с сайта.`
-    buttons.push({ text: '📞 Позвонить', url: `tel:${e164}` })
     buttons.push({
       text: '💬 WhatsApp',
       url: `https://wa.me/${e164.replace('+', '')}?text=${encodeURIComponent(greeting)}`,
     })
   }
 
-  // Always offer a way to copy contact
-  if (buttons.length === 0) {
-    return null // unknown format, no buttons (text already shows the raw contact)
-  }
-  // Telegram inline_keyboard: array of rows; we group all into one row, fallback to 2 rows if 3+
-  return buttons.length <= 2 ? [buttons] : [[buttons[0], buttons[1]], [buttons[2]]]
+  if (buttons.length === 0) return null
+  return [buttons] // single row
 }
 
 async function sendToOwner(text, replyMarkup) {
