@@ -23,16 +23,56 @@ function escapeMd(s) {
   return String(s).replace(/[*_`\[\]()~>#+=|{}.!-]/g, '\\$&')
 }
 
-async function sendToOwner(text) {
+// Parse a contact string and produce inline-keyboard buttons for instant reply
+function buildContactButtons(contact, name) {
+  const trimmed = (contact || '').trim()
+  const buttons = []
+
+  // Telegram username — @username, t.me/username, or bare username (no digits)
+  const tgMatch =
+    trimmed.match(/(?:^|[\s/])@([a-zA-Z0-9_]{4,32})\b/) ||
+    trimmed.match(/t\.me\/([a-zA-Z0-9_]{4,32})/i) ||
+    (/^[a-zA-Z][a-zA-Z0-9_]{3,31}$/.test(trimmed) ? [, trimmed] : null)
+  if (tgMatch) {
+    buttons.push({ text: '✈️ Написать в Telegram', url: `https://t.me/${tgMatch[1]}` })
+  }
+
+  // Phone: extract digits, normalize to E.164 (+7… for Russia)
+  const digits = trimmed.replace(/[^\d]/g, '')
+  if (digits.length >= 10 && digits.length <= 15) {
+    let e164
+    if (digits.length === 11 && digits.startsWith('8')) e164 = '+7' + digits.slice(1)
+    else if (digits.length === 10) e164 = '+7' + digits
+    else if (trimmed.startsWith('+')) e164 = '+' + digits
+    else e164 = '+' + digits
+    const greeting = `Здравствуйте, ${name || 'это'}! УходМогил по вашей заявке с сайта.`
+    buttons.push({ text: '📞 Позвонить', url: `tel:${e164}` })
+    buttons.push({
+      text: '💬 WhatsApp',
+      url: `https://wa.me/${e164.replace('+', '')}?text=${encodeURIComponent(greeting)}`,
+    })
+  }
+
+  // Always offer a way to copy contact
+  if (buttons.length === 0) {
+    return null // unknown format, no buttons (text already shows the raw contact)
+  }
+  // Telegram inline_keyboard: array of rows; we group all into one row, fallback to 2 rows if 3+
+  return buttons.length <= 2 ? [buttons] : [[buttons[0], buttons[1]], [buttons[2]]]
+}
+
+async function sendToOwner(text, replyMarkup) {
+  const body = {
+    chat_id: OWNER_CHAT_ID,
+    text,
+    parse_mode: 'MarkdownV2',
+    disable_web_page_preview: true,
+  }
+  if (replyMarkup) body.reply_markup = { inline_keyboard: replyMarkup }
   const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: OWNER_CHAT_ID,
-      text,
-      parse_mode: 'MarkdownV2',
-      disable_web_page_preview: true,
-    }),
+    body: JSON.stringify(body),
   })
   const data = await res.json()
   if (!data.ok) console.error('Telegram sendMessage failed:', data)
@@ -92,7 +132,10 @@ module.exports = async (req, res) => {
       return res.status(500).json({ ok: false, error: 'Server misconfigured' })
     }
 
-    const ok = await sendToOwner(text)
+    // Build inline-keyboard buttons (only for leads — reviews don't need contact action)
+    const replyMarkup = type === 'lead' ? buildContactButtons(contact, name) : null
+
+    const ok = await sendToOwner(text, replyMarkup)
     if (!ok) return res.status(500).json({ ok: false, error: 'Telegram delivery failed' })
 
     return res.status(200).json({ ok: true })
