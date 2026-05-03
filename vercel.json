@@ -3,6 +3,10 @@
     "api/webhook.js": {
       "memory": 128,
       "maxDuration": 10
+    },
+    "api/lead.js": {
+      "memory": 128,
+      "maxDuration": 10
     }
   }
 }
