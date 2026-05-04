@@ -1,5 +1,7 @@
 const OWNER_CHAT_ID = 696698928
 const BOT_TOKEN = process.env.BOT_TOKEN
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fxxmhnmvttvfatdlxpxk.supabase.co'
+const SUPABASE_SECRET = process.env.SUPABASE_SECRET_KEY
 
 async function sendMessage(chatId, text, options = {}) {
   const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
@@ -9,6 +11,28 @@ async function sendMessage(chatId, text, options = {}) {
   })
   const data = await res.json()
   console.log('sendMessage result:', JSON.stringify(data))
+  return data
+}
+
+async function sb(path, method = 'GET', body = null, prefer = '') {
+  if (!SUPABASE_SECRET) return null
+  const headers = {
+    apikey: SUPABASE_SECRET,
+    Authorization: `Bearer ${SUPABASE_SECRET}`,
+    'Content-Type': 'application/json',
+  }
+  if (prefer) headers['Prefer'] = prefer
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  })
+  const text = await r.text()
+  if (!r.ok) {
+    console.error(`Supabase ${method} ${path} ${r.status}: ${text.slice(0, 200)}`)
+    return null
+  }
+  return text ? JSON.parse(text) : null
 }
 
 module.exports = async (req, res) => {
@@ -24,7 +48,29 @@ module.exports = async (req, res) => {
 
   // Владелец отвечает на пересланное сообщение → отправляем клиенту
   if (chatId === OWNER_CHAT_ID && message.reply_to_message) {
+    const replyToId = message.reply_to_message.message_id
     const original = message.reply_to_message.text || ''
+
+    // Path 1: web-chat session reply (find session by tg_root_message_id)
+    if (SUPABASE_SECRET) {
+      const sessions = await sb(
+        `web_chat_sessions?tg_root_message_id=eq.${replyToId}&select=id,status`,
+      )
+      if (sessions && sessions.length > 0) {
+        const session = sessions[0]
+        await sb(
+          `web_chat_messages`,
+          'POST',
+          { session_id: session.id, role: 'admin', content: text, tg_message_id: replyToId },
+        )
+        await sendMessage(OWNER_CHAT_ID, '✅ Ответ отправлен в чат на сайте', {
+          reply_to_message_id: message.message_id,
+        })
+        return res.status(200).send('OK')
+      }
+    }
+
+    // Path 2: legacy direct-TG-customer reply (chat_id in message text)
     const match = original.match(/chat_id: (\d+)/)
     if (match) {
       const customerChatId = parseInt(match[1])

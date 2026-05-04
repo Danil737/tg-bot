@@ -7,6 +7,14 @@
     "api/lead.js": {
       "memory": 128,
       "maxDuration": 10
+    },
+    "api/chat-send.js": {
+      "memory": 256,
+      "maxDuration": 25
+    },
+    "api/chat-poll.js": {
+      "memory": 128,
+      "maxDuration": 10
     }
   }
 }
