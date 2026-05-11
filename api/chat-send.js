@@ -5,14 +5,15 @@
 // Flow:
 //   1. Find or create chat session
 //   2. Save user message
-//   3. Get conversation history → ask Gemini for next reply
+//   3. Get conversation history → ask Groq (llama-3.3-70b-versatile) for next reply
 //   4. Save AI reply
 //   5. If AI message contains escalation marker → notify owner in TG, mark session escalated
 //   6. Always send a copy/notification to TG (silent for active sessions, loud for escalations)
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fxxmhnmvttvfatdlxpxk.supabase.co'
 const SUPABASE_SECRET = process.env.SUPABASE_SECRET_KEY
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY
+const GROQ_API_KEY = process.env.GROQ_API_KEY
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile'
 const BOT_TOKEN = process.env.BOT_TOKEN
 const OWNER_CHAT_ID = 696698928
 
@@ -120,44 +121,38 @@ async function setSessionEscalated(sessionId, tgRootMessageId) {
   )
 }
 
-async function geminiReply(history, userMessage) {
-  // Build Gemini contents: alternate user/model
-  const contents = []
+async function aiReply(history, userMessage) {
+  // Groq использует OpenAI-совместимый формат. Admin-сообщения исключаем —
+  // это реплики менеджера через TG, AI не должен делать вид что их помнит.
+  const messages = [{ role: 'system', content: SYSTEM_PROMPT }]
   for (const m of history) {
-    if (m.role === 'user') contents.push({ role: 'user', parts: [{ text: m.content }] })
-    else if (m.role === 'ai') contents.push({ role: 'model', parts: [{ text: m.content }] })
-    // skip 'admin' messages — they're outside AI's context, AI shouldn't pretend to remember admin replies
+    if (m.role === 'user') messages.push({ role: 'user', content: m.content })
+    else if (m.role === 'ai') messages.push({ role: 'assistant', content: m.content })
   }
-  contents.push({ role: 'user', parts: [{ text: userMessage }] })
+  messages.push({ role: 'user', content: userMessage })
 
   const body = {
-    contents,
-    systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-    generationConfig: {
-      temperature: 0.7,
-      maxOutputTokens: 300,
-      topP: 0.9,
-    },
-    safetySettings: [
-      { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
-      { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
-      { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
-      { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
-    ],
+    model: GROQ_MODEL,
+    messages,
+    temperature: 0.7,
+    max_tokens: 300,
+    top_p: 0.9,
   }
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${GEMINI_API_KEY}`
-  const r = await fetch(url, {
+  const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${GROQ_API_KEY}`,
+    },
     body: JSON.stringify(body),
   })
   const data = await r.json()
   if (!r.ok) {
-    console.error('Gemini error:', JSON.stringify(data).slice(0, 400))
-    throw new Error(`Gemini ${r.status}`)
+    console.error('Groq error:', JSON.stringify(data).slice(0, 400))
+    throw new Error(`Groq ${r.status}`)
   }
-  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '(пустой ответ от AI)'
+  const text = data?.choices?.[0]?.message?.content || '(пустой ответ от AI)'
   return text.trim()
 }
 
@@ -249,23 +244,23 @@ module.exports = async (req, res) => {
 
     // AI reply path
     const history = await getRecentMessages(session.id, 30)
-    // history includes the just-saved user message (last); send to Gemini WITHOUT it (it's 'userMessage' separately)
+    // history includes the just-saved user message (last); send to AI WITHOUT it (it's 'userMessage' separately)
     const historyForAI = history.slice(0, -1).filter((m) => m.role === 'user' || m.role === 'ai')
 
-    let aiReply = ''
+    let aiText = ''
     let escalate = false
     try {
-      aiReply = await geminiReply(historyForAI, message.trim())
+      aiText = await aiReply(historyForAI, message.trim())
     } catch (err) {
       console.error('AI failed, fallback escalation:', err.message)
-      aiReply = '✓ Передаю менеджеру. Свяжемся с вами в течение 5 минут.'
+      aiText = '✓ Передаю менеджеру. Свяжемся с вами в течение 5 минут.'
       escalate = true
     }
 
-    await saveMessage(session.id, 'ai', aiReply)
+    await saveMessage(session.id, 'ai', aiText)
 
     // Detect escalation marker
-    if (aiReply.includes(ESCALATION_MARKER) || aiReply.startsWith('✓')) {
+    if (aiText.includes(ESCALATION_MARKER) || aiText.startsWith('✓')) {
       escalate = true
     }
 
@@ -277,7 +272,7 @@ module.exports = async (req, res) => {
     return res.status(200).json({
       ok: true,
       sessionId: session.id,
-      aiReply,
+      aiReply: aiText,
       escalated: escalate,
     })
   } catch (e) {
