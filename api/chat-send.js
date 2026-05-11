@@ -134,26 +134,51 @@ async function aiReply(history, userMessage) {
   const body = {
     model: GROQ_MODEL,
     messages,
-    temperature: 0.7,
+    // temperature 0.2: бот должен следовать жёсткому скрипту (сбор лида),
+    // а не творчески импровизировать цены/услуги
+    temperature: 0.2,
     max_tokens: 300,
     top_p: 0.9,
   }
 
-  const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${GROQ_API_KEY}`,
-    },
-    body: JSON.stringify(body),
-  })
-  const data = await r.json()
-  if (!r.ok) {
-    console.error('Groq error:', JSON.stringify(data).slice(0, 400))
-    throw new Error(`Groq ${r.status}`)
+  // Retry с exponential backoff: 0ms → 600ms → 1500ms. Groq иногда отдаёт 5xx/429,
+  // но обычно следующая попытка проходит. Если все 3 попытки упали — бросаем,
+  // вызывающий код переведёт чат на менеджера (escalation fallback).
+  const delays = [0, 600, 1500]
+  let lastErr = null
+  for (const delay of delays) {
+    if (delay) await new Promise((r) => setTimeout(r, delay))
+    try {
+      const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+        },
+        body: JSON.stringify(body),
+      })
+      const data = await r.json()
+      if (!r.ok) {
+        console.error(`Groq error (delay=${delay}):`, JSON.stringify(data).slice(0, 400))
+        // 4xx (кроме 429) — не retry'им, это наша ошибка запроса
+        if (r.status >= 400 && r.status < 500 && r.status !== 429) {
+          throw new Error(`Groq ${r.status} (no retry)`)
+        }
+        lastErr = new Error(`Groq ${r.status}`)
+        continue
+      }
+      const text = data?.choices?.[0]?.message?.content?.trim()
+      if (!text) {
+        lastErr = new Error('Groq: empty response')
+        continue
+      }
+      return text
+    } catch (err) {
+      lastErr = err
+      console.error(`Groq fetch err (delay=${delay}):`, err.message)
+    }
   }
-  const text = data?.choices?.[0]?.message?.content || '(пустой ответ от AI)'
-  return text.trim()
+  throw lastErr || new Error('Groq: all retries failed')
 }
 
 function escapeMd(s) {
