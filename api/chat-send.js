@@ -248,6 +248,18 @@ module.exports = async (req, res) => {
     // Save user message
     await saveMessage(session.id, 'user', message.trim())
 
+    // EARLY ESCALATION CHECK: prevent race condition where 2 quick user messages
+    // both go to AI before status='escalated' propagates from first reply
+    if (session.status !== 'escalated') {
+      const prevHistory = await getRecentMessages(session.id, 10)
+      const lastAi = [...prevHistory].reverse().find(m => m.role === 'ai')
+      if (lastAi && (lastAi.content.includes(ESCALATION_MARKER) || lastAi.content.startsWith('✓'))) {
+        // Force-promote session to escalated
+        try { await setSessionEscalated(session.id, session.tg_root_message_id || 0) } catch {}
+        session.status = 'escalated'
+      }
+    }
+
     // Don't AI-reply if session is escalated — admin handles it now
     if (session.status === 'escalated') {
       // Notify owner about new follow-up message
@@ -289,9 +301,13 @@ module.exports = async (req, res) => {
       escalate = true
     }
 
-    if (escalate && BOT_TOKEN) {
-      const fullHistory = await getRecentMessages(session.id, 30)
-      await notifyOwnerEscalation(session, fullHistory)
+    if (escalate) {
+      // Set status FIRST so any concurrent requests see escalated state
+      try { await setSessionEscalated(session.id, session.tg_root_message_id || 0) } catch (e) { console.error('escalate status set failed:', e.message) }
+      if (BOT_TOKEN) {
+        const fullHistory = await getRecentMessages(session.id, 30)
+        await notifyOwnerEscalation(session, fullHistory)
+      }
     }
 
     return res.status(200).json({
