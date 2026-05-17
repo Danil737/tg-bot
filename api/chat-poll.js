@@ -68,12 +68,15 @@ module.exports = async (req, res) => {
     const sinceFilter = safeSince ? `&created_at=gt.${encodeURIComponent(safeSince)}` : ''
 
     // Fetch session + verify token before returning messages.
-    const sessRows = await sb(`web_chat_sessions?id=eq.${sessionId}&select=status,session_token`)
+    // select=* so the code keeps working before migration 002 is applied — the
+    // session_token field will simply be undefined and we grandfather the session.
+    const sessRows = await sb(`web_chat_sessions?id=eq.${sessionId}&select=*`)
     if (!sessRows || sessRows.length === 0) {
       return res.status(404).json({ ok: false, error: 'Session not found' })
     }
     const session = sessRows[0]
-    // If session has a token, request must match. Legacy sessions without token are grandfathered.
+    // If session has a token, request must match. Legacy sessions (or pre-migration
+    // sessions) without token are grandfathered.
     if (session.session_token && session.session_token !== token) {
       return res.status(403).json({ ok: false, error: 'Forbidden' })
     }
