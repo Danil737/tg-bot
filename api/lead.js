@@ -4,10 +4,31 @@
 //   • main contact form (type='lead') — заявка на услугу
 //   • review form         (type='review') — пользовательский отзыв на модерацию
 
-const OWNER_CHAT_ID = 696698928
+const { fetchWithTimeout } = require('./_lib')
+
+const OWNER_CHAT_ID = parseInt(process.env.OWNER_CHAT_ID || '696698928', 10)
 const BOT_TOKEN = process.env.BOT_TOKEN
 
 const ALLOWED_ORIGINS = ['https://uhod-mogil.ru', 'https://www.uhod-mogil.ru', 'http://localhost:3000']
+
+// In-memory soft throttle by IP. Resets on cold start, which is fine — this
+// stops obvious spammers, not a determined attacker (use Vercel WAF for that).
+const ipRate = new Map()
+const IP_RATE_MAX = 5         // requests per window
+const IP_RATE_WINDOW_MS = 60_000
+
+function checkIpRate(ip) {
+  if (!ip) return false
+  const now = Date.now()
+  const entry = ipRate.get(ip) || { count: 0, resetAt: now + IP_RATE_WINDOW_MS }
+  if (now >= entry.resetAt) {
+    entry.count = 0
+    entry.resetAt = now + IP_RATE_WINDOW_MS
+  }
+  entry.count++
+  ipRate.set(ip, entry)
+  return entry.count > IP_RATE_MAX
+}
 
 function setCors(req, res) {
   const origin = req.headers.origin || ''
@@ -66,11 +87,15 @@ async function sendToOwner(text, replyMarkup) {
     disable_web_page_preview: true,
   }
   if (replyMarkup) body.reply_markup = { inline_keyboard: replyMarkup }
-  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
+  const res = await fetchWithTimeout(
+    `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+    6000,
+  )
   const data = await res.json()
   if (!data.ok) console.error('Telegram sendMessage failed:', data)
   return data.ok
@@ -80,6 +105,12 @@ module.exports = async (req, res) => {
   setCors(req, res)
   if (req.method === 'OPTIONS') return res.status(204).end()
   if (req.method !== 'POST') return res.status(405).json({ ok: false, error: 'Method not allowed' })
+
+  // Spam protection: limit per IP. Vercel forwards real IP in x-forwarded-for.
+  const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket?.remoteAddress
+  if (checkIpRate(ip)) {
+    return res.status(429).json({ ok: false, error: 'Слишком много заявок. Попробуйте через минуту.' })
+  }
 
   try {
     const body = req.body || {}
