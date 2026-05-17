@@ -3,6 +3,10 @@ const BOT_TOKEN = process.env.BOT_TOKEN
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fxxmhnmvttvfatdlxpxk.supabase.co'
 const SUPABASE_SECRET = process.env.SUPABASE_SECRET_KEY
 
+function htmlEsc(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
 async function sendMessage(chatId, text, options = {}) {
   const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
     method: 'POST',
@@ -77,7 +81,12 @@ module.exports = async (req, res) => {
     const match = original.match(/chat_?id: (\d+)/)
     if (match) {
       const customerChatId = parseInt(match[1])
-      await sendMessage(customerChatId, `💬 *Менеджер УходМогил:*\n${text}`)
+      // Use HTML so user-typed text with stray *, _, [ ] won't break parsing
+      await sendMessage(
+        customerChatId,
+        `💬 <b>Менеджер УходМогил:</b>\n${htmlEsc(text)}`,
+        { parse_mode: 'HTML' },
+      )
       await sendMessage(OWNER_CHAT_ID, '✅ Ответ отправлен клиенту')
     }
     return res.status(200).send('OK')
@@ -100,21 +109,23 @@ module.exports = async (req, res) => {
       return res.status(200).send('OK')
     }
 
-    // Реальное сообщение — автоответ клиенту + уведомление владельцу
-    await sendMessage(chatId,
-      '👋 Сообщение получено! Менеджер ответит вам в ближайшее время.\n\n' +
-      'Также можете оставить заявку на сайте: https://uhod-mogil.ru'
-    )
-
-    // chatid без подчёркивания, чтобы Markdown-парсер Telegram не пытался
-    // трактовать `_` как начало курсива и не ломал последующий regex-разбор
-    await sendMessage(OWNER_CHAT_ID,
-      `📨 *Новое сообщение от клиента*\n\n` +
-      `👤 Имя: ${name}\n` +
-      (from.username ? `📎 @${from.username}\n` : '') +
-      `💬 Сообщение: ${text}\n\n` +
-      `chatid: ${chatId}\n\n` +
-      `↩️ _Нажми "Ответить" на это сообщение чтобы написать клиенту_`
+    // НИКАКОГО автоответа клиенту: владелец сам отвечает через TG reply
+    // в течение 5 минут (это и есть «настоящий» ответ).
+    //
+    // Уведомление владельцу — HTML-режим: имя/username/текст приходят от
+    // пользователя и могут содержать *, _, [, ], которые ломали Markdown-парсер
+    // (например, username `AJ_171` отбивал ошибку «can't parse entities»).
+    // HTML escape всех пользовательских полей решает проблему раз и навсегда.
+    const usernameLine = from.username ? `📎 @${htmlEsc(from.username)}\n` : ''
+    await sendMessage(
+      OWNER_CHAT_ID,
+      `📨 <b>Новое сообщение от клиента</b>\n\n` +
+        `👤 Имя: ${htmlEsc(name)}\n` +
+        usernameLine +
+        `💬 Сообщение: ${htmlEsc(text)}\n\n` +
+        `chatid: ${chatId}\n\n` +
+        `↩️ <i>Нажми "Ответить" на это сообщение чтобы написать клиенту</i>`,
+      { parse_mode: 'HTML' },
     )
   }
 
