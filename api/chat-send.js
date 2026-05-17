@@ -274,10 +274,13 @@ module.exports = async (req, res) => {
         return res.status(400).json({ ok: false, error: 'Invalid token' })
       }
       session = await getSession(incomingSessionId)
-      // If session has a token, request token must match. Old sessions without
-      // token are grandfathered for transition; new ones are token-gated.
+      // If session has a token but request doesn't match — DON'T 403 (would
+      // strand legitimate users whose browser missed the token on first save,
+      // or who had sessions auto-tokenized by migration 002). Instead, silently
+      // fall through to creating a fresh session — they lose history but UX
+      // stays smooth. The original session remains intact for its real owner.
       if (session && session.session_token && session.session_token !== incomingToken) {
-        return res.status(403).json({ ok: false, error: 'Forbidden' })
+        session = null
       }
     }
     if (!session) {

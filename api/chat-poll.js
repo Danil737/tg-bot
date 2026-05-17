@@ -75,10 +75,13 @@ module.exports = async (req, res) => {
       return res.status(404).json({ ok: false, error: 'Session not found' })
     }
     const session = sessRows[0]
-    // If session has a token, request must match. Legacy sessions (or pre-migration
-    // sessions) without token are grandfathered.
+    // If session has a token but request doesn't match — return empty result
+    // with status='closed' instead of 403. The widget stops polling on
+    // 'closed' status; the next user message will create a fresh session.
+    // This avoids stranding users whose localStorage lost the token (or never
+    // got it because session was auto-tokenized by migration 002).
     if (session.session_token && session.session_token !== token) {
-      return res.status(403).json({ ok: false, error: 'Forbidden' })
+      return res.status(200).json({ ok: true, messages: [], status: 'closed' })
     }
 
     const messages = await sb(
