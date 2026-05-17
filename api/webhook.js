@@ -123,7 +123,8 @@ module.exports = async (req, res) => {
         '✅ Выезд 1–3 дня\n' +
         '✅ Цены от 3 000 ₽\n\n' +
         'Напишите нам — на каком кладбище нужна уборка и что сделать. Ответим быстро!\n\n' +
-        '🌐 Сайт: https://uhod-mogil.ru'
+        '🌐 Сайт: https://uhod-mogil.ru\n' +
+        '📢 Наш канал с фотоотчётами и календарём поминальных дней: <a href="https://t.me/uhod_mogil">t.me/uhod_mogil</a>'
       )
       return res.status(200).send('OK')
     }
