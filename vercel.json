@@ -19,6 +19,18 @@
     "api/channel-post.js": {
       "memory": 128,
       "maxDuration": 10
+    },
+    "api/subscribe.js": {
+      "memory": 128,
+      "maxDuration": 8
+    },
+    "api/unsubscribe.js": {
+      "memory": 128,
+      "maxDuration": 8
+    },
+    "api/newsletter-check.js": {
+      "memory": 128,
+      "maxDuration": 15
     }
   }
 }
