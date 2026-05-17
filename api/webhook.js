@@ -70,8 +70,11 @@ module.exports = async (req, res) => {
       }
     }
 
-    // Path 2: legacy direct-TG-customer reply (chat_id in message text)
-    const match = original.match(/chat_id: (\d+)/)
+    // Path 2: legacy direct-TG-customer reply (chatid in message text).
+    // Underscore-less form: Telegram parses `chat_id` as markdown italic start
+    // and strips the `_`, so the .text we get back reads "chatid: NNN".
+    // Regex tolerates both forms in case old escalation messages still exist.
+    const match = original.match(/chat_?id: (\d+)/)
     if (match) {
       const customerChatId = parseInt(match[1])
       await sendMessage(customerChatId, `💬 *Менеджер УходМогил:*\n${text}`)
@@ -82,7 +85,8 @@ module.exports = async (req, res) => {
 
   // Сообщение от клиента
   if (chatId !== OWNER_CHAT_ID) {
-    // Команда /start
+    // Команда /start — только приветствие клиенту, владельца НЕ дёргаем
+    // (это не лид, человек просто открыл бота кнопкой Start)
     if (text === '/start') {
       await sendMessage(chatId,
         '🌿 *Добро пожаловать в УходМогил!*\n\n' +
@@ -93,21 +97,23 @@ module.exports = async (req, res) => {
         'Напишите нам — на каком кладбище нужна уборка и что сделать. Ответим быстро!\n\n' +
         '🌐 Сайт: https://uhod-mogil.ru'
       )
-    } else {
-      // Автоответ клиенту
-      await sendMessage(chatId,
-        '👋 Сообщение получено! Менеджер ответит вам в ближайшее время.\n\n' +
-        'Также можете оставить заявку на сайте: https://uhod-mogil.ru'
-      )
+      return res.status(200).send('OK')
     }
 
-    // Пересылаем владельцу
+    // Реальное сообщение — автоответ клиенту + уведомление владельцу
+    await sendMessage(chatId,
+      '👋 Сообщение получено! Менеджер ответит вам в ближайшее время.\n\n' +
+      'Также можете оставить заявку на сайте: https://uhod-mogil.ru'
+    )
+
+    // chatid без подчёркивания, чтобы Markdown-парсер Telegram не пытался
+    // трактовать `_` как начало курсива и не ломал последующий regex-разбор
     await sendMessage(OWNER_CHAT_ID,
       `📨 *Новое сообщение от клиента*\n\n` +
       `👤 Имя: ${name}\n` +
       (from.username ? `📎 @${from.username}\n` : '') +
       `💬 Сообщение: ${text}\n\n` +
-      `chat_id: ${chatId}\n\n` +
+      `chatid: ${chatId}\n\n` +
       `↩️ _Нажми "Ответить" на это сообщение чтобы написать клиенту_`
     )
   }
