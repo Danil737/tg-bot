@@ -4,10 +4,8 @@ const OWNER_CHAT_ID = parseInt(process.env.OWNER_CHAT_ID || '696698928', 10)
 const BOT_TOKEN = process.env.BOT_TOKEN
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fxxmhnmvttvfatdlxpxk.supabase.co'
 const SUPABASE_SECRET = process.env.SUPABASE_SECRET_KEY
-// Set this when registering the webhook: ?secret_token=<TG_WEBHOOK_SECRET>
-// Telegram echoes it as X-Telegram-Bot-Api-Secret-Token. Without this, anyone
-// can POST forged updates to /api/webhook and spoof owner-reply messages.
 const WEBHOOK_SECRET = process.env.TG_WEBHOOK_SECRET
+const PHOTOS_BUCKET = 'chat-photos'      // создать вручную в Supabase Storage (public)
 
 function htmlEsc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -24,9 +22,22 @@ async function sendMessage(chatId, text, options = {}) {
     8000,
   )
   const data = await res.json()
-  // Don't log full payload — TG echoes back the request URL on errors which
-  // can contain the bot token. safeLog strips that.
   safeLog('sendMessage.ok=' + data.ok, { ok: data.ok, error_code: data.error_code, description: data.description })
+  return data
+}
+
+async function sendPhoto(chatId, photoUrl, caption = '') {
+  const res = await fetchWithTimeout(
+    `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, photo: photoUrl, caption, parse_mode: 'HTML' }),
+    },
+    10000,
+  )
+  const data = await res.json()
+  safeLog('sendPhoto.ok=' + data.ok, { ok: data.ok, error_code: data.error_code, description: data.description })
   return data
 }
 
@@ -51,17 +62,72 @@ async function sb(path, method = 'GET', body = null, prefer = '') {
   return text ? JSON.parse(text) : null
 }
 
+// Скачивает фото из Telegram и загружает в Supabase Storage.
+// Возвращает public URL или null при ошибке.
+async function downloadAndStorePhoto(fileId, sessionId) {
+  try {
+    // 1. Получить путь к файлу в TG
+    const fileRes = await fetchWithTimeout(
+      `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`,
+      {},
+      6000,
+    )
+    const fileData = await fileRes.json()
+    if (!fileData.ok) {
+      console.error('getFile failed:', fileData.description)
+      return null
+    }
+    const filePath = fileData.result.file_path  // 'photos/file_XX.jpg'
+    const ext = filePath.split('.').pop() || 'jpg'
+
+    // 2. Скачать файл
+    const downloadRes = await fetchWithTimeout(
+      `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`,
+      {},
+      15000,
+    )
+    if (!downloadRes.ok) {
+      console.error('TG file download failed:', downloadRes.status)
+      return null
+    }
+    const buffer = await downloadRes.arrayBuffer()
+
+    // 3. Загрузить в Supabase Storage
+    const storagePath = `${sessionId}/${Date.now()}.${ext}`
+    const uploadRes = await fetchWithTimeout(
+      `${SUPABASE_URL}/storage/v1/object/${PHOTOS_BUCKET}/${storagePath}`,
+      {
+        method: 'POST',
+        headers: {
+          apikey: SUPABASE_SECRET,
+          Authorization: `Bearer ${SUPABASE_SECRET}`,
+          'Content-Type': ext === 'png' ? 'image/png' : 'image/jpeg',
+        },
+        body: buffer,
+      },
+      15000,
+    )
+    if (!uploadRes.ok) {
+      const errText = await uploadRes.text()
+      console.error('Supabase Storage upload failed:', uploadRes.status, errText.slice(0, 200))
+      return null
+    }
+
+    // 4. Public URL (bucket должен быть public — см. миграцию 004)
+    return `${SUPABASE_URL}/storage/v1/object/public/${PHOTOS_BUCKET}/${storagePath}`
+  } catch (e) {
+    console.error('downloadAndStorePhoto error:', e.message)
+    return null
+  }
+}
+
 module.exports = async (req, res) => {
   if (req.method !== 'POST') return res.status(200).send('OK')
 
-  // CRITICAL: verify the secret token Telegram sends in headers.
-  // Without this check, anyone can forge updates and spoof OWNER_CHAT_ID
-  // reply_to_message → bot will send arbitrary text to any customer.
   if (WEBHOOK_SECRET) {
     const provided = req.headers['x-telegram-bot-api-secret-token']
     if (provided !== WEBHOOK_SECRET) {
       console.warn('webhook: invalid secret_token header')
-      // Always 200 so attackers can't differentiate "wrong secret" from "no message".
       return res.status(200).send('OK')
     }
   } else {
@@ -73,13 +139,17 @@ module.exports = async (req, res) => {
 
   const chatId = message.chat?.id
   const text = message.text || ''
+  const caption = message.caption || ''
   const from = message.from || {}
   const name = [from.first_name, from.last_name].filter(Boolean).join(' ')
 
-  // Owner replies to a forwarded escalation message → forward back to the customer
+  // === OWNER REPLY ===
   if (chatId === OWNER_CHAT_ID && message.reply_to_message) {
     const replyToId = message.reply_to_message.message_id
     const original = message.reply_to_message.text || ''
+
+    // Если в reply есть фото — это photo report от owner'a
+    const hasPhoto = Array.isArray(message.photo) && message.photo.length > 0
 
     // Path 1: web-chat session reply (find session by tg_root_message_id)
     if (SUPABASE_SECRET) {
@@ -88,6 +158,38 @@ module.exports = async (req, res) => {
       )
       if (sessions && sessions.length > 0) {
         const session = sessions[0]
+
+        if (hasPhoto) {
+          // Берём самое большое разрешение (последний элемент в массиве)
+          const largestPhoto = message.photo[message.photo.length - 1]
+          const photoUrl = await downloadAndStorePhoto(largestPhoto.file_id, session.id)
+
+          if (!photoUrl) {
+            await sendMessage(OWNER_CHAT_ID, '❌ Не удалось загрузить фото в Storage. Попробуй ещё раз.', {
+              reply_to_message_id: message.message_id,
+            })
+            return res.status(200).send('OK')
+          }
+
+          await sb(
+            `web_chat_messages`,
+            'POST',
+            {
+              session_id: session.id,
+              role: 'admin',
+              content: caption || '📷 Фото',
+              tg_message_id: replyToId,
+              media_url: photoUrl,
+              media_type: 'photo',
+            },
+          )
+          await sendMessage(OWNER_CHAT_ID, '✅ Фото отправлено клиенту в чат на сайте', {
+            reply_to_message_id: message.message_id,
+          })
+          return res.status(200).send('OK')
+        }
+
+        // Текстовый reply
         await sb(
           `web_chat_messages`,
           'POST',
@@ -104,6 +206,21 @@ module.exports = async (req, res) => {
     const match = original.match(/chat_?id: (\d+)/)
     if (match) {
       const customerChatId = parseInt(match[1])
+
+      if (hasPhoto) {
+        // Для TG-клиента используем file_id напрямую — TG умеет ресенд по file_id, не нужно скачивать
+        const largestPhoto = message.photo[message.photo.length - 1]
+        await sendPhoto(
+          customerChatId,
+          largestPhoto.file_id,
+          caption ? `💬 <b>Менеджер УходМогил:</b>\n${htmlEsc(caption)}` : '',
+        )
+        await sendMessage(OWNER_CHAT_ID, '✅ Фото отправлено клиенту', {
+          reply_to_message_id: message.message_id,
+        })
+        return res.status(200).send('OK')
+      }
+
       await sendMessage(
         customerChatId,
         `💬 <b>Менеджер УходМогил:</b>\n${htmlEsc(text)}`,
@@ -113,7 +230,7 @@ module.exports = async (req, res) => {
     return res.status(200).send('OK')
   }
 
-  // Message from a TG customer (not owner-reply)
+  // === CUSTOMER MESSAGE in direct TG ===
   if (chatId !== OWNER_CHAT_ID) {
     if (text === '/start') {
       await sendMessage(chatId,
@@ -130,6 +247,24 @@ module.exports = async (req, res) => {
     }
 
     const usernameLine = from.username ? `📎 @${htmlEsc(from.username)}\n` : ''
+
+    // Если клиент прислал фото — пересылаем тебе в TG как уведомление
+    if (Array.isArray(message.photo) && message.photo.length > 0) {
+      const largestPhoto = message.photo[message.photo.length - 1]
+      await sendPhoto(
+        OWNER_CHAT_ID,
+        largestPhoto.file_id,
+        `📨 <b>Фото от клиента</b>\n\n` +
+          `👤 ${htmlEsc(name)}\n` +
+          usernameLine +
+          (caption ? `💬 ${htmlEsc(caption)}\n\n` : '') +
+          `chatid: ${chatId}\n\n` +
+          `↩️ <i>Ответ на это сообщение (включая фото) — пересылается клиенту</i>`,
+      )
+      return res.status(200).send('OK')
+    }
+
+    // Текстовое сообщение
     await sendMessage(
       OWNER_CHAT_ID,
       `📨 <b>Новое сообщение от клиента</b>\n\n` +

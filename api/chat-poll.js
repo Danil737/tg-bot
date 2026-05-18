@@ -86,7 +86,7 @@ module.exports = async (req, res) => {
 
     const messages = await sb(
       `web_chat_messages?session_id=eq.${sessionId}${sinceFilter}` +
-        `&order=created_at.asc&select=role,content,created_at`,
+        `&order=created_at.asc&select=role,content,created_at,media_url,media_type`,
     )
 
     return res.status(200).json({ ok: true, messages, status: session.status || 'active' })
