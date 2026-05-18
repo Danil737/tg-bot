@@ -150,6 +150,8 @@ module.exports = async (req, res) => {
 
     // Если в reply есть фото — это photo report от owner'a
     const hasPhoto = Array.isArray(message.photo) && message.photo.length > 0
+    // media_group_id — если фото часть альбома (несколько фото одной отправкой)
+    const mediaGroupId = message.media_group_id || null
 
     // Path 1: web-chat session reply (find session by tg_root_message_id)
     if (SUPABASE_SECRET) {
@@ -177,15 +179,28 @@ module.exports = async (req, res) => {
             {
               session_id: session.id,
               role: 'admin',
-              content: caption || '📷 Фото',
+              content: caption || '',          // для альбома caption есть только у первого фото
               tg_message_id: replyToId,
               media_url: photoUrl,
               media_type: 'photo',
+              media_group_id: mediaGroupId,
             },
           )
-          await sendMessage(OWNER_CHAT_ID, '✅ Фото отправлено клиенту в чат на сайте', {
-            reply_to_message_id: message.message_id,
-          })
+
+          // Для альбома: проверяем сколько фото уже загружено, шлём только короткое подтверждение
+          if (mediaGroupId) {
+            const groupRows = await sb(
+              `web_chat_messages?session_id=eq.${session.id}&media_group_id=eq.${mediaGroupId}&select=id`,
+            )
+            const groupCount = groupRows?.length || 1
+            await sendMessage(OWNER_CHAT_ID, `📷 ${groupCount}`, {
+              reply_to_message_id: message.message_id,
+            })
+          } else {
+            await sendMessage(OWNER_CHAT_ID, '✅ Фото отправлено клиенту в чат на сайте', {
+              reply_to_message_id: message.message_id,
+            })
+          }
           return res.status(200).send('OK')
         }
 
@@ -215,7 +230,7 @@ module.exports = async (req, res) => {
           largestPhoto.file_id,
           caption ? `💬 <b>Менеджер УходМогил:</b>\n${htmlEsc(caption)}` : '',
         )
-        await sendMessage(OWNER_CHAT_ID, '✅ Фото отправлено клиенту', {
+        await sendMessage(OWNER_CHAT_ID, mediaGroupId ? '📷' : '✅ Фото отправлено клиенту', {
           reply_to_message_id: message.message_id,
         })
         return res.status(200).send('OK')
