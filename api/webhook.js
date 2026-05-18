@@ -146,7 +146,14 @@ module.exports = async (req, res) => {
   // === OWNER REPLY ===
   if (chatId === OWNER_CHAT_ID && message.reply_to_message) {
     const replyToId = message.reply_to_message.message_id
-    const original = message.reply_to_message.text || ''
+    // Фикс бага: при reply на фото-сообщение от бота, текст лежит в caption,
+    // а не в text. Без || caption regex `chatid: NNN` ничего не находил
+    // и бот молча игнорил ответ владельца. Также бывает text_html/caption_html
+    // когда reply на html-форматированное сообщение.
+    const original =
+      message.reply_to_message.text ||
+      message.reply_to_message.caption ||
+      ''
 
     // Если в reply есть фото — это photo report от owner'a
     const hasPhoto = Array.isArray(message.photo) && message.photo.length > 0
