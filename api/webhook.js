@@ -1,19 +1,30 @@
 const { fetchWithTimeout, safeLog } = require('./_lib')
 
 const OWNER_CHAT_ID = parseInt(process.env.OWNER_CHAT_ID || '696698928', 10)
-const BOT_TOKEN = process.env.BOT_TOKEN
+const BOT_TOKEN = process.env.BOT_TOKEN                         // @uhodmogil_bot
+const BOT_TOKEN_KMH = process.env.BOT_TOKEN_KMH                 // @KissMyHandsBot
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fxxmhnmvttvfatdlxpxk.supabase.co'
 const SUPABASE_SECRET = process.env.SUPABASE_SECRET_KEY
 const WEBHOOK_SECRET = process.env.TG_WEBHOOK_SECRET
 const PHOTOS_BUCKET = 'chat-photos'      // создать вручную в Supabase Storage (public)
 
+// Site detection from sourceUrl stored on the chat session.
+function detectSite(sourceUrl) {
+  const u = String(sourceUrl || '').toLowerCase()
+  if (u.includes('kissmyhands.ru') || u.includes('kissmyhands.vercel.app')) return 'kissmyhands'
+  return 'uhod-mogil'
+}
+function botTokenForSite(site) {
+  return site === 'kissmyhands' ? BOT_TOKEN_KMH : BOT_TOKEN
+}
+
 function htmlEsc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
 
-async function sendMessage(chatId, text, options = {}) {
+async function sendMessage(chatId, text, options = {}, botToken = BOT_TOKEN) {
   const res = await fetchWithTimeout(
-    `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
+    `https://api.telegram.org/bot${botToken}/sendMessage`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -26,9 +37,9 @@ async function sendMessage(chatId, text, options = {}) {
   return data
 }
 
-async function sendPhoto(chatId, photoUrl, caption = '') {
+async function sendPhoto(chatId, photoUrl, caption = '', botToken = BOT_TOKEN) {
   const res = await fetchWithTimeout(
-    `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`,
+    `https://api.telegram.org/bot${botToken}/sendPhoto`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -64,11 +75,11 @@ async function sb(path, method = 'GET', body = null, prefer = '') {
 
 // Скачивает фото из Telegram и загружает в Supabase Storage.
 // Возвращает public URL или null при ошибке.
-async function downloadAndStorePhoto(fileId, sessionId) {
+async function downloadAndStorePhoto(fileId, sessionId, botToken = BOT_TOKEN) {
   try {
     // 1. Получить путь к файлу в TG
     const fileRes = await fetchWithTimeout(
-      `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`,
+      `https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`,
       {},
       6000,
     )
@@ -82,7 +93,7 @@ async function downloadAndStorePhoto(fileId, sessionId) {
 
     // 2. Скачать файл
     const downloadRes = await fetchWithTimeout(
-      `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`,
+      `https://api.telegram.org/file/bot${botToken}/${filePath}`,
       {},
       15000,
     )
@@ -134,6 +145,17 @@ module.exports = async (req, res) => {
     console.warn('webhook: TG_WEBHOOK_SECRET not set — webhook is UNAUTHENTICATED. Set it ASAP.')
   }
 
+  // Identify incoming bot: @KissMyHandsBot sets webhook with ?bot=kmh in URL,
+  // @uhodmogil_bot sets webhook without query (default = uhod-mogil).
+  // Used for: (a) direct customer /start replies (which bot greeted them);
+  // (b) confirmations to owner (use same bot's chat thread).
+  const incomingBot = (req.query?.bot || '').toString() === 'kmh' ? 'kmh' : 'uhod'
+  const incomingBotToken = incomingBot === 'kmh' ? BOT_TOKEN_KMH : BOT_TOKEN
+  if (!incomingBotToken) {
+    safeLog('webhook: bot token not configured', { incomingBot })
+    return res.status(200).send('OK')
+  }
+
   const { message } = req.body || {}
   if (!message) return res.status(200).send('OK')
 
@@ -163,20 +185,24 @@ module.exports = async (req, res) => {
     // Path 1: web-chat session reply (find session by tg_root_message_id)
     if (SUPABASE_SECRET) {
       const sessions = await sb(
-        `web_chat_sessions?tg_root_message_id=eq.${replyToId}&select=id,status`,
+        `web_chat_sessions?tg_root_message_id=eq.${replyToId}&select=id,status,source_url`,
       )
       if (sessions && sessions.length > 0) {
         const session = sessions[0]
+        // Use bot derived from session.source_url for confirmation messages.
+        // This way owner sees ✅ in the same chat thread (KMH or uhod-mogil).
+        const sessionSite = detectSite(session.source_url || '')
+        const sessionBotToken = botTokenForSite(sessionSite) || incomingBotToken
 
         if (hasPhoto) {
           // Берём самое большое разрешение (последний элемент в массиве)
           const largestPhoto = message.photo[message.photo.length - 1]
-          const photoUrl = await downloadAndStorePhoto(largestPhoto.file_id, session.id)
+          const photoUrl = await downloadAndStorePhoto(largestPhoto.file_id, session.id, sessionBotToken)
 
           if (!photoUrl) {
             await sendMessage(OWNER_CHAT_ID, '❌ Не удалось загрузить фото в Storage. Попробуй ещё раз.', {
               reply_to_message_id: message.message_id,
-            })
+            }, sessionBotToken)
             return res.status(200).send('OK')
           }
 
@@ -202,11 +228,11 @@ module.exports = async (req, res) => {
             const groupCount = groupRows?.length || 1
             await sendMessage(OWNER_CHAT_ID, `📷 ${groupCount}`, {
               reply_to_message_id: message.message_id,
-            })
+            }, sessionBotToken)
           } else {
             await sendMessage(OWNER_CHAT_ID, '✅ Фото отправлено клиенту в чат на сайте', {
               reply_to_message_id: message.message_id,
-            })
+            }, sessionBotToken)
           }
           return res.status(200).send('OK')
         }
@@ -219,15 +245,17 @@ module.exports = async (req, res) => {
         )
         await sendMessage(OWNER_CHAT_ID, '✅ Ответ отправлен в чат на сайте', {
           reply_to_message_id: message.message_id,
-        })
+        }, sessionBotToken)
         return res.status(200).send('OK')
       }
     }
 
-    // Path 2: legacy direct-TG-customer reply (chatid in message text)
+    // Path 2: legacy direct-TG-customer reply (chatid in message text).
+    // Bot identity comes from incomingBot (which webhook URL received this update).
     const match = original.match(/chat_?id: (\d+)/)
     if (match) {
       const customerChatId = parseInt(match[1])
+      const managerLabel = incomingBot === 'kmh' ? 'Сергей · Kiss My Hands' : 'Менеджер УходМогил'
 
       if (hasPhoto) {
         // Для TG-клиента используем file_id напрямую — TG умеет ресенд по file_id, не нужно скачивать
@@ -235,19 +263,22 @@ module.exports = async (req, res) => {
         await sendPhoto(
           customerChatId,
           largestPhoto.file_id,
-          caption ? `💬 <b>Менеджер УходМогил:</b>\n${htmlEsc(caption)}` : '',
+          caption ? `💬 <b>${managerLabel}:</b>\n${htmlEsc(caption)}` : '',
+          incomingBotToken,
         )
         await sendMessage(OWNER_CHAT_ID, mediaGroupId ? '📷' : '✅ Фото отправлено клиенту', {
           reply_to_message_id: message.message_id,
-        })
+        }, incomingBotToken)
         return res.status(200).send('OK')
       }
 
       await sendMessage(
         customerChatId,
-        `💬 <b>Менеджер УходМогил:</b>\n${htmlEsc(text)}`,
+        `💬 <b>${managerLabel}:</b>\n${htmlEsc(text)}`,
+        {},
+        incomingBotToken,
       )
-      await sendMessage(OWNER_CHAT_ID, '✅ Ответ отправлен клиенту')
+      await sendMessage(OWNER_CHAT_ID, '✅ Ответ отправлен клиенту', {}, incomingBotToken)
     }
     return res.status(200).send('OK')
   }
@@ -255,6 +286,22 @@ module.exports = async (req, res) => {
   // === CUSTOMER MESSAGE in direct TG ===
   if (chatId !== OWNER_CHAT_ID) {
     if (text === '/start') {
+      if (incomingBot === 'kmh') {
+        await sendMessage(chatId,
+          '👋 <b>Kiss My Hands — премиум-ремонт ванных в Москве</b>\n\n' +
+          'Я — Сергей Козлов, мастер с 23-летним опытом. Работаю один, без бригад. ' +
+          '4.92★ из 168 отзывов на ПРОФИ.РУ.\n\n' +
+          '💰 Раздельный туалет под ключ: 120–150 тыс ₽\n' +
+          '💰 Раздельная ванная: 180–200 тыс ₽\n' +
+          '💰 Совмещённый санузел: 300–350 тыс ₽\n' +
+          '⏱ 12–15 рабочих дней\n' +
+          '🛡 Гарантия 20+ лет\n\n' +
+          'Опишите задачу — что нужно сделать, какой дом/серия. Можно прислать фото. Отвечу лично.\n\n' +
+          '🌐 <a href="https://kissmyhands.ru">kissmyhands.ru</a>',
+          {}, incomingBotToken,
+        )
+        return res.status(200).send('OK')
+      }
       await sendMessage(chatId,
         '🌿 <b>Добро пожаловать в УходМогил!</b>\n\n' +
         'Мы занимаемся профессиональной уборкой и уходом за могилами на кладбищах Москвы.\n\n' +
@@ -263,25 +310,28 @@ module.exports = async (req, res) => {
         '✅ Цены от 3 000 ₽\n\n' +
         'Напишите нам — на каком кладбище нужна уборка и что сделать. Ответим быстро!\n\n' +
         '🌐 Сайт: https://uhod-mogil.ru\n' +
-        '📢 Наш канал с фотоотчётами и календарём поминальных дней: <a href="https://t.me/uhod_mogil">t.me/uhod_mogil</a>'
+        '📢 Наш канал с фотоотчётами и календарём поминальных дней: <a href="https://t.me/uhod_mogil">t.me/uhod_mogil</a>',
+        {}, incomingBotToken,
       )
       return res.status(200).send('OK')
     }
 
     const usernameLine = from.username ? `📎 @${htmlEsc(from.username)}\n` : ''
+    const botLabel = incomingBot === 'kmh' ? 'Kiss My Hands' : 'УходМогил'
 
-    // Если клиент прислал фото — пересылаем тебе в TG как уведомление
+    // Если клиент прислал фото — пересылаем тебе в TG как уведомление (через тот же бот)
     if (Array.isArray(message.photo) && message.photo.length > 0) {
       const largestPhoto = message.photo[message.photo.length - 1]
       await sendPhoto(
         OWNER_CHAT_ID,
         largestPhoto.file_id,
-        `📨 <b>Фото от клиента</b>\n\n` +
+        `📨 <b>Фото от клиента — ${botLabel}</b>\n\n` +
           `👤 ${htmlEsc(name)}\n` +
           usernameLine +
           (caption ? `💬 ${htmlEsc(caption)}\n\n` : '') +
           `chatid: ${chatId}\n\n` +
           `↩️ <i>Ответ на это сообщение (включая фото) — пересылается клиенту</i>`,
+        incomingBotToken,
       )
       return res.status(200).send('OK')
     }
@@ -289,12 +339,13 @@ module.exports = async (req, res) => {
     // Текстовое сообщение
     await sendMessage(
       OWNER_CHAT_ID,
-      `📨 <b>Новое сообщение от клиента</b>\n\n` +
+      `📨 <b>Новое сообщение от клиента — ${botLabel}</b>\n\n` +
         `👤 Имя: ${htmlEsc(name)}\n` +
         usernameLine +
         `💬 Сообщение: ${htmlEsc(text)}\n\n` +
         `chatid: ${chatId}\n\n` +
         `↩️ <i>Нажми "Ответить" на это сообщение чтобы написать клиенту</i>`,
+      {}, incomingBotToken,
     )
   }
 

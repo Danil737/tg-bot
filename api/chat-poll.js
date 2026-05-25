@@ -13,6 +13,8 @@ const SUPABASE_SECRET = process.env.SUPABASE_SECRET_KEY
 const ALLOWED_ORIGINS = [
   'https://uhod-mogil.ru',
   'https://www.uhod-mogil.ru',
+  'https://kissmyhands.ru',
+  'https://www.kissmyhands.ru',
   'http://localhost:3000',
 ]
 

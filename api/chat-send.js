@@ -15,8 +15,25 @@ const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fxxmhnmvttvfatdlxpxk.s
 const SUPABASE_SECRET = process.env.SUPABASE_SECRET_KEY
 const GROQ_API_KEY = process.env.GROQ_API_KEY
 const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile'
-const BOT_TOKEN = process.env.BOT_TOKEN
+const BOT_TOKEN = process.env.BOT_TOKEN                      // @uhodmogil_bot
+const BOT_TOKEN_KMH = process.env.BOT_TOKEN_KMH              // @KissMyHandsBot
 const OWNER_CHAT_ID = parseInt(process.env.OWNER_CHAT_ID || '696698928', 10)
+
+// Site detection: derive from sourceUrl. Returns 'kissmyhands' | 'uhod-mogil'.
+// Defaults to 'uhod-mogil' to preserve existing behavior if sourceUrl is missing.
+function detectSite(sourceUrl) {
+  const u = String(sourceUrl || '').toLowerCase()
+  if (u.includes('kissmyhands.ru') || u.includes('kissmyhands.vercel.app')) return 'kissmyhands'
+  return 'uhod-mogil'
+}
+
+function botTokenForSite(site) {
+  return site === 'kissmyhands' ? BOT_TOKEN_KMH : BOT_TOKEN
+}
+
+function siteLabel(site) {
+  return site === 'kissmyhands' ? 'Kiss My Hands' : 'УходМогил'
+}
 
 // Triggers escalation. Tolerant to flection ("передам/передаю менеджеру/специалисту")
 // and the leading checkmark fallback.
@@ -30,6 +47,8 @@ const RATE_WINDOW_MS = 60 * 1000
 const ALLOWED_ORIGINS = [
   'https://uhod-mogil.ru',
   'https://www.uhod-mogil.ru',
+  'https://kissmyhands.ru',
+  'https://www.kissmyhands.ru',
   'http://localhost:3000',
 ]
 
@@ -194,7 +213,9 @@ function escapeMd(s) {
   return String(s || '').replace(/[*_`\[\]()~>#+=|{}.!-]/g, '\\$&')
 }
 
-async function tgSendOwner(text) {
+async function tgSendOwner(text, site = 'uhod-mogil') {
+  const token = botTokenForSite(site)
+  if (!token) { safeLog('TG sendOwner: no token for site', { site }); return null }
   const body = {
     chat_id: OWNER_CHAT_ID,
     text,
@@ -202,7 +223,7 @@ async function tgSendOwner(text) {
     disable_web_page_preview: true,
   }
   const r = await fetchWithTimeout(
-    `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
+    `https://api.telegram.org/bot${token}/sendMessage`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -211,11 +232,11 @@ async function tgSendOwner(text) {
     6000,
   )
   const data = await r.json()
-  if (!data.ok) safeLog('TG sendOwner failed', { error_code: data.error_code, description: data.description })
+  if (!data.ok) safeLog('TG sendOwner failed', { site, error_code: data.error_code, description: data.description })
   return data.result?.message_id || null
 }
 
-async function notifyOwnerEscalation(session, history) {
+async function notifyOwnerEscalation(session, history, site = 'uhod-mogil') {
   const dialogue = history
     .map((m) => {
       const tag = m.role === 'user' ? '👤' : m.role === 'ai' ? '🤖' : '👨‍💼'
@@ -223,11 +244,11 @@ async function notifyOwnerEscalation(session, history) {
     })
     .join('\n\n')
   const text =
-    `🆕 *НОВЫЙ ЧАТ С САЙТА*  \\(${escapeMd(session.id.slice(0, 8))}\\)\n\n` +
-    `_Источник:_ ${escapeMd(session.source_url || 'uhod-mogil.ru')}\n\n` +
+    `🆕 *НОВЫЙ ЧАТ — ${escapeMd(siteLabel(site))}*  \\(${escapeMd(session.id.slice(0, 8))}\\)\n\n` +
+    `_Источник:_ ${escapeMd(session.source_url || siteLabel(site))}\n\n` +
     `*Диалог:*\n${escapeMd(dialogue).slice(0, 3500)}\n\n` +
     `_Ответь на это сообщение \\(reply\\) — клиент увидит на сайте\\._`
-  const messageId = await tgSendOwner(text)
+  const messageId = await tgSendOwner(text, site)
   if (messageId) {
     await setSessionEscalated(session.id, messageId)
   }
@@ -256,6 +277,8 @@ module.exports = async (req, res) => {
 
   try {
     const { sessionId: incomingSessionId, token: incomingToken, message, sourceUrl, userAgent } = req.body || {}
+    // Detect site from sourceUrl; falls back to Origin header for safety.
+    const site = detectSite(sourceUrl || req.headers.origin || '')
 
     if (!message || typeof message !== 'string' || !message.trim()) {
       return res.status(400).json({ ok: false, error: 'Empty message' })
@@ -295,7 +318,24 @@ module.exports = async (req, res) => {
     // Save user message
     await saveMessage(session.id, 'user', message.trim())
 
-    // Early escalation check (race condition guard)
+    // KissMyHands: no AI — every chat goes straight to owner (Сергей отвечает лично).
+    // Force escalation on first message; subsequent messages just forward as in escalated mode.
+    if (site === 'kissmyhands' && session.status !== 'escalated') {
+      try { await setSessionEscalated(session.id, session.tg_root_message_id || 0) } catch {}
+      session.status = 'escalated'
+      if (botTokenForSite(site)) {
+        const fullHistory = await getRecentMessages(session.id, 30)
+        await notifyOwnerEscalation(session, fullHistory, site)
+      }
+      return res.status(200).json({
+        ok: true,
+        sessionId: session.id,
+        token: session.session_token,
+        escalated: true,
+      })
+    }
+
+    // Early escalation check (race condition guard) — uhod-mogil only (has AI)
     if (session.status !== 'escalated') {
       const prevHistory = await getRecentMessages(session.id, 10)
       const lastAi = [...prevHistory].reverse().find((m) => m.role === 'ai')
@@ -306,12 +346,12 @@ module.exports = async (req, res) => {
     }
 
     if (session.status === 'escalated') {
-      if (BOT_TOKEN) {
+      if (botTokenForSite(site)) {
         const text =
-          `💬 *Новое сообщение в чате* \\(${escapeMd(session.id.slice(0, 8))}\\)\n\n` +
+          `💬 *Новое сообщение в чате* — ${escapeMd(siteLabel(site))} \\(${escapeMd(session.id.slice(0, 8))}\\)\n\n` +
           `👤 ${escapeMd(message.slice(0, 1000))}\n\n` +
           `_Reply на это сообщение → клиент увидит\\._`
-        const tgMessageId = await tgSendOwner(text)
+        const tgMessageId = await tgSendOwner(text, site)
         if (tgMessageId) {
           await sb(`web_chat_sessions?id=eq.${session.id}`, 'PATCH', {
             tg_root_message_id: tgMessageId,
@@ -347,9 +387,9 @@ module.exports = async (req, res) => {
 
     if (escalate) {
       try { await setSessionEscalated(session.id, session.tg_root_message_id || 0) } catch (e) { console.error('escalate status set failed:', e.message) }
-      if (BOT_TOKEN) {
+      if (botTokenForSite(site)) {
         const fullHistory = await getRecentMessages(session.id, 30)
-        await notifyOwnerEscalation(session, fullHistory)
+        await notifyOwnerEscalation(session, fullHistory, site)
       }
     }
 

@@ -15,9 +15,22 @@ const { isValidUuid, fetchWithTimeout, safeLog } = require('./_lib')
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fxxmhnmvttvfatdlxpxk.supabase.co'
 const SUPABASE_SECRET = process.env.SUPABASE_SECRET_KEY
-const BOT_TOKEN = process.env.BOT_TOKEN
+const BOT_TOKEN = process.env.BOT_TOKEN                  // @uhodmogil_bot
+const BOT_TOKEN_KMH = process.env.BOT_TOKEN_KMH          // @KissMyHandsBot
 const OWNER_CHAT_ID = parseInt(process.env.OWNER_CHAT_ID || '696698928', 10)
 const PHOTOS_BUCKET = 'chat-photos'
+
+function detectSite(sourceUrl) {
+  const u = String(sourceUrl || '').toLowerCase()
+  if (u.includes('kissmyhands.ru') || u.includes('kissmyhands.vercel.app')) return 'kissmyhands'
+  return 'uhod-mogil'
+}
+function botTokenForSite(site) {
+  return site === 'kissmyhands' ? BOT_TOKEN_KMH : BOT_TOKEN
+}
+function siteLabel(site) {
+  return site === 'kissmyhands' ? 'Kiss My Hands' : 'УходМогил'
+}
 
 const MAX_BYTES = 5 * 1024 * 1024            // 5 MB после base64-декодирования
 const ALLOWED_MIMES = ['image/jpeg', 'image/png', 'image/webp', 'image/heic']
@@ -25,6 +38,8 @@ const ALLOWED_MIMES = ['image/jpeg', 'image/png', 'image/webp', 'image/heic']
 const ALLOWED_ORIGINS = [
   'https://uhod-mogil.ru',
   'https://www.uhod-mogil.ru',
+  'https://kissmyhands.ru',
+  'https://www.kissmyhands.ru',
   'http://localhost:3000',
 ]
 
@@ -58,17 +73,18 @@ function htmlEsc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
 
-async function notifyOwnerPhoto(session, photoUrl, caption) {
-  if (!BOT_TOKEN) return null
+async function notifyOwnerPhoto(session, photoUrl, caption, site = 'uhod-mogil') {
+  const token = botTokenForSite(site)
+  if (!token) return null
   const sessionShort = session.id.slice(0, 8)
   const captionText =
-    `📨 <b>Клиент прислал фото в чат на сайте</b>\n` +
+    `📨 <b>Клиент прислал фото — ${htmlEsc(siteLabel(site))}</b>\n` +
     `🔗 Сессия: <code>${sessionShort}</code>\n` +
     (caption ? `💬 ${htmlEsc(caption)}\n` : '') +
     `\n↩️ <i>Reply на это сообщение (текст или фото) → попадёт клиенту в чат на сайте</i>`
 
   const res = await fetchWithTimeout(
-    `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`,
+    `https://api.telegram.org/bot${token}/sendPhoto`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -189,7 +205,9 @@ module.exports = async (req, res) => {
     )
 
     // Уведомляем владельца в TG (это «тихая» эскалация если её ещё не было)
-    await notifyOwnerPhoto(session, publicUrl, trimmedCaption)
+    // Site выводим либо из source_url сессии, либо из текущего Origin.
+    const site = detectSite(session.source_url || req.headers.origin || '')
+    await notifyOwnerPhoto(session, publicUrl, trimmedCaption, site)
 
     return res.status(200).json({ ok: true, mediaUrl: publicUrl })
   } catch (e) {
