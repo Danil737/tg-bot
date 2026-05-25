@@ -18,6 +18,8 @@ const SUPABASE_SECRET = process.env.SUPABASE_SECRET_KEY
 const BOT_TOKEN = process.env.BOT_TOKEN                  // @uhodmogil_bot
 const BOT_TOKEN_KMH = process.env.BOT_TOKEN_KMH          // @KissMyHandsBot
 const OWNER_CHAT_ID = parseInt(process.env.OWNER_CHAT_ID || '696698928', 10)
+const KMH_EXTRA_OWNER_IDS = (process.env.KMH_EXTRA_OWNER_IDS || '1650405909')
+  .split(',').map(s => parseInt(s.trim(), 10)).filter(Boolean)
 const PHOTOS_BUCKET = 'chat-photos'
 
 function detectSite(sourceUrl) {
@@ -73,6 +75,26 @@ function htmlEsc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
 
+async function sendPhotoToChat(chatId, photoUrl, captionText, token) {
+  const res = await fetchWithTimeout(
+    `https://api.telegram.org/bot${token}/sendPhoto`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        photo: photoUrl,
+        caption: captionText,
+        parse_mode: 'HTML',
+      }),
+    },
+    10000,
+  )
+  const data = await res.json()
+  safeLog('sendPhotoToChat.ok=' + data.ok, { chatId, error_code: data.error_code, description: data.description })
+  return data.result?.message_id || null
+}
+
 async function notifyOwnerPhoto(session, photoUrl, caption, site = 'uhod-mogil') {
   const token = botTokenForSite(site)
   if (!token) return null
@@ -83,34 +105,34 @@ async function notifyOwnerPhoto(session, photoUrl, caption, site = 'uhod-mogil')
     (caption ? `💬 ${htmlEsc(caption)}\n` : '') +
     `\n↩️ <i>Reply на это сообщение (текст или фото) → попадёт клиенту в чат на сайте</i>`
 
-  const res = await fetchWithTimeout(
-    `https://api.telegram.org/bot${token}/sendPhoto`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: OWNER_CHAT_ID,
-        photo: photoUrl,
-        caption: captionText,
-        parse_mode: 'HTML',
-      }),
-    },
-    10000,
-  )
-  const data = await res.json()
-  safeLog('notifyOwnerPhoto.ok=' + data.ok, { error_code: data.error_code, description: data.description })
+  // Primary owner (Daniil)
+  const primaryMsgId = await sendPhotoToChat(OWNER_CHAT_ID, photoUrl, captionText, token)
+  // Extra owners for KMH (Сергей)
+  const extraMsgIds = []
+  if (site === 'kissmyhands') {
+    for (const cid of KMH_EXTRA_OWNER_IDS) {
+      try {
+        const mid = await sendPhotoToChat(cid, photoUrl, captionText, token)
+        if (mid) extraMsgIds.push({ chat_id: cid, message_id: mid })
+      } catch (e) {
+        safeLog('extra owner photo failed', { cid, err: e.message })
+      }
+    }
+  }
 
-  // Если сессия ещё не escalated — обновляем tg_root_message_id, чтобы reply работал
-  if (data.ok && data.result?.message_id && !session.tg_root_message_id) {
+  // Если сессия ещё не escalated — обновляем tg_root_message_id (+ user_contact для extra)
+  if (primaryMsgId && !session.tg_root_message_id) {
     try {
-      await sb(`web_chat_sessions?id=eq.${session.id}`, 'PATCH', {
-        tg_root_message_id: data.result.message_id,
-      })
+      const patch = { tg_root_message_id: primaryMsgId }
+      if (extraMsgIds.length > 0) {
+        patch.user_contact = 'extra:' + extraMsgIds.map(e => `${e.chat_id}:${e.message_id}`).join(';')
+      }
+      await sb(`web_chat_sessions?id=eq.${session.id}`, 'PATCH', patch)
     } catch (e) {
       console.error('failed to update tg_root_message_id:', e.message)
     }
   }
-  return data.result?.message_id || null
+  return primaryMsgId
 }
 
 module.exports = async (req, res) => {

@@ -17,7 +17,11 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY
 const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile'
 const BOT_TOKEN = process.env.BOT_TOKEN                      // @uhodmogil_bot
 const BOT_TOKEN_KMH = process.env.BOT_TOKEN_KMH              // @KissMyHandsBot
-const OWNER_CHAT_ID = parseInt(process.env.OWNER_CHAT_ID || '696698928', 10)
+const OWNER_CHAT_ID = parseInt(process.env.OWNER_CHAT_ID || '696698928', 10)  // Daniil — primary
+// Secondary owners per-site (comma-separated chat_ids).
+// kissmyhands: Сергей (мастер) тоже получает уведомления и может отвечать.
+const KMH_EXTRA_OWNER_IDS = (process.env.KMH_EXTRA_OWNER_IDS || '1650405909')
+  .split(',').map(s => parseInt(s.trim(), 10)).filter(Boolean)
 
 // Site detection: derive from sourceUrl. Returns 'kissmyhands' | 'uhod-mogil'.
 // Defaults to 'uhod-mogil' to preserve existing behavior if sourceUrl is missing.
@@ -213,11 +217,9 @@ function escapeMd(s) {
   return String(s || '').replace(/[*_`\[\]()~>#+=|{}.!-]/g, '\\$&')
 }
 
-async function tgSendOwner(text, site = 'uhod-mogil') {
-  const token = botTokenForSite(site)
-  if (!token) { safeLog('TG sendOwner: no token for site', { site }); return null }
+async function tgSendChat(chatId, text, token) {
   const body = {
-    chat_id: OWNER_CHAT_ID,
+    chat_id: chatId,
     text,
     parse_mode: 'MarkdownV2',
     disable_web_page_preview: true,
@@ -232,8 +234,36 @@ async function tgSendOwner(text, site = 'uhod-mogil') {
     6000,
   )
   const data = await r.json()
-  if (!data.ok) safeLog('TG sendOwner failed', { site, error_code: data.error_code, description: data.description })
+  if (!data.ok) safeLog('TG sendMessage failed', { chatId, error_code: data.error_code, description: data.description })
   return data.result?.message_id || null
+}
+
+async function tgSendOwner(text, site = 'uhod-mogil') {
+  const token = botTokenForSite(site)
+  if (!token) { safeLog('TG sendOwner: no token for site', { site }); return null }
+  // Primary owner — Daniil
+  const primaryMsgId = await tgSendChat(OWNER_CHAT_ID, text, token)
+  // Extra owners for KMH (Сергей). Each gets the same text; their msg_ids are
+  // stored in user_contact below so we can route their replies back to the session.
+  const extraMsgIds = []
+  if (site === 'kissmyhands') {
+    for (const cid of KMH_EXTRA_OWNER_IDS) {
+      try {
+        const mid = await tgSendChat(cid, text, token)
+        if (mid) extraMsgIds.push({ chat_id: cid, message_id: mid })
+      } catch (e) {
+        safeLog('TG send to extra owner failed', { cid, err: e.message })
+      }
+    }
+  }
+  return { primaryMsgId, extraMsgIds }
+}
+
+// Encodes extra-owner msg_ids into user_contact field so reply lookup can find session.
+// Format: "extra:<chat_id>:<msg_id>;<chat_id>:<msg_id>"
+function encodeExtraOwners(extraMsgIds) {
+  if (!extraMsgIds || extraMsgIds.length === 0) return null
+  return 'extra:' + extraMsgIds.map(e => `${e.chat_id}:${e.message_id}`).join(';')
 }
 
 async function notifyOwnerEscalation(session, history, site = 'uhod-mogil') {
@@ -248,11 +278,16 @@ async function notifyOwnerEscalation(session, history, site = 'uhod-mogil') {
     `_Источник:_ ${escapeMd(session.source_url || siteLabel(site))}\n\n` +
     `*Диалог:*\n${escapeMd(dialogue).slice(0, 3500)}\n\n` +
     `_Ответь на это сообщение \\(reply\\) — клиент увидит на сайте\\._`
-  const messageId = await tgSendOwner(text, site)
-  if (messageId) {
-    await setSessionEscalated(session.id, messageId)
+  const result = await tgSendOwner(text, site)
+  if (!result) return null
+  const { primaryMsgId, extraMsgIds } = result
+  if (primaryMsgId) {
+    const patch = { status: 'escalated', tg_root_message_id: primaryMsgId }
+    const extraEncoded = encodeExtraOwners(extraMsgIds)
+    if (extraEncoded) patch.user_contact = extraEncoded
+    await sb(`web_chat_sessions?id=eq.${session.id}`, 'PATCH', patch)
   }
-  return messageId
+  return primaryMsgId
 }
 
 // Soft per-session rate limit: too many user messages in a short window
@@ -351,11 +386,12 @@ module.exports = async (req, res) => {
           `💬 *Новое сообщение в чате* — ${escapeMd(siteLabel(site))} \\(${escapeMd(session.id.slice(0, 8))}\\)\n\n` +
           `👤 ${escapeMd(message.slice(0, 1000))}\n\n` +
           `_Reply на это сообщение → клиент увидит\\._`
-        const tgMessageId = await tgSendOwner(text, site)
-        if (tgMessageId) {
-          await sb(`web_chat_sessions?id=eq.${session.id}`, 'PATCH', {
-            tg_root_message_id: tgMessageId,
-          })
+        const result = await tgSendOwner(text, site)
+        if (result?.primaryMsgId) {
+          const patch = { tg_root_message_id: result.primaryMsgId }
+          const extraEncoded = encodeExtraOwners(result.extraMsgIds)
+          if (extraEncoded) patch.user_contact = extraEncoded
+          await sb(`web_chat_sessions?id=eq.${session.id}`, 'PATCH', patch)
         }
       }
       return res.status(200).json({

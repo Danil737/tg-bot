@@ -1,6 +1,9 @@
 const { fetchWithTimeout, safeLog } = require('./_lib')
 
 const OWNER_CHAT_ID = parseInt(process.env.OWNER_CHAT_ID || '696698928', 10)
+const KMH_EXTRA_OWNER_IDS = (process.env.KMH_EXTRA_OWNER_IDS || '1650405909')
+  .split(',').map(s => parseInt(s.trim(), 10)).filter(Boolean)
+const ALL_OWNER_IDS = new Set([OWNER_CHAT_ID, ...KMH_EXTRA_OWNER_IDS])
 const BOT_TOKEN = process.env.BOT_TOKEN                         // @uhodmogil_bot
 const BOT_TOKEN_KMH = process.env.BOT_TOKEN_KMH                 // @KissMyHandsBot
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fxxmhnmvttvfatdlxpxk.supabase.co'
@@ -16,6 +19,37 @@ function detectSite(sourceUrl) {
 }
 function botTokenForSite(site) {
   return site === 'kissmyhands' ? BOT_TOKEN_KMH : BOT_TOKEN
+}
+
+// Parse user_contact field that may encode extra-owner notification msg_ids.
+// Format: "extra:<chat_id>:<msg_id>;<chat_id>:<msg_id>"
+function parseExtraOwners(userContact) {
+  if (!userContact || !userContact.startsWith('extra:')) return []
+  return userContact.slice(6).split(';').map(part => {
+    const [cid, mid] = part.split(':').map(Number)
+    return { chat_id: cid, message_id: mid }
+  }).filter(p => p.chat_id && p.message_id)
+}
+
+// Notify all owners about a forwarded site message. Used to broadcast Daniil's reply
+// to Sergey (and vice versa) so both see the conversation.
+async function broadcastToOtherOwners(text, fromChatId, botToken) {
+  const recipients = [OWNER_CHAT_ID, ...KMH_EXTRA_OWNER_IDS].filter(cid => cid !== fromChatId)
+  for (const cid of recipients) {
+    try {
+      await fetchWithTimeout(
+        `https://api.telegram.org/bot${botToken}/sendMessage`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: cid, text, parse_mode: 'HTML', disable_web_page_preview: true }),
+        },
+        6000,
+      )
+    } catch (e) {
+      safeLog('broadcastToOtherOwners failed', { cid, err: e.message })
+    }
+  }
 }
 
 function htmlEsc(s) {
@@ -166,8 +200,10 @@ module.exports = async (req, res) => {
   const name = [from.first_name, from.last_name].filter(Boolean).join(' ')
 
   // === OWNER REPLY ===
-  if (chatId === OWNER_CHAT_ID && message.reply_to_message) {
+  // Either Daniil OR Сергей (any of ALL_OWNER_IDS) replying counts.
+  if (ALL_OWNER_IDS.has(chatId) && message.reply_to_message) {
     const replyToId = message.reply_to_message.message_id
+    const replierChatId = chatId  // who's replying (for broadcasting to the other owner)
     // Фикс бага: при reply на фото-сообщение от бота, текст лежит в caption,
     // а не в text. Без || caption regex `chatid: NNN` ничего не находил
     // и бот молча игнорил ответ владельца. Также бывает text_html/caption_html
@@ -182,11 +218,21 @@ module.exports = async (req, res) => {
     // media_group_id — если фото часть альбома (несколько фото одной отправкой)
     const mediaGroupId = message.media_group_id || null
 
-    // Path 1: web-chat session reply (find session by tg_root_message_id)
+    // Path 1: web-chat session reply (find session by tg_root_message_id OR by
+    // user_contact-encoded extra-owner msg_id).
     if (SUPABASE_SECRET) {
-      const sessions = await sb(
-        `web_chat_sessions?tg_root_message_id=eq.${replyToId}&select=id,status,source_url`,
+      let sessions = await sb(
+        `web_chat_sessions?tg_root_message_id=eq.${replyToId}&select=id,status,source_url,user_contact`,
       )
+      // If not found by primary tg_root_message_id, look up via extra-owner mapping.
+      // Сергей's reply has reply_to_message.message_id = его копии notification,
+      // которая записана в user_contact как "extra:<chat_id>:<msg_id>;..."
+      if (!sessions || sessions.length === 0) {
+        const pattern = `extra:%${replierChatId}:${replyToId}%`
+        sessions = await sb(
+          `web_chat_sessions?user_contact=ilike.${encodeURIComponent(pattern)}&select=id,status,source_url,user_contact`,
+        )
+      }
       if (sessions && sessions.length > 0) {
         const session = sessions[0]
         // Use bot derived from session.source_url for confirmation messages.
@@ -200,7 +246,7 @@ module.exports = async (req, res) => {
           const photoUrl = await downloadAndStorePhoto(largestPhoto.file_id, session.id, sessionBotToken)
 
           if (!photoUrl) {
-            await sendMessage(OWNER_CHAT_ID, '❌ Не удалось загрузить фото в Storage. Попробуй ещё раз.', {
+            await sendMessage(replierChatId, '❌ Не удалось загрузить фото в Storage. Попробуй ещё раз.', {
               reply_to_message_id: message.message_id,
             }, sessionBotToken)
             return res.status(200).send('OK')
@@ -226,14 +272,21 @@ module.exports = async (req, res) => {
               `web_chat_messages?session_id=eq.${session.id}&media_group_id=eq.${mediaGroupId}&select=id`,
             )
             const groupCount = groupRows?.length || 1
-            await sendMessage(OWNER_CHAT_ID, `📷 ${groupCount}`, {
+            await sendMessage(replierChatId, `📷 ${groupCount}`, {
               reply_to_message_id: message.message_id,
             }, sessionBotToken)
           } else {
-            await sendMessage(OWNER_CHAT_ID, '✅ Фото отправлено клиенту в чат на сайте', {
+            await sendMessage(replierChatId, '✅ Фото отправлено клиенту в чат на сайте', {
               reply_to_message_id: message.message_id,
             }, sessionBotToken)
           }
+          // Broadcast photo notification to the other owner (без файла — у них уже было уведомление)
+          const replierLabel = replierChatId === OWNER_CHAT_ID ? 'Daniil' : 'Сергей'
+          await broadcastToOtherOwners(
+            `📷 <b>${replierLabel} отправил фото клиенту</b> (сессия ${session.id.slice(0, 8)})`,
+            replierChatId,
+            sessionBotToken,
+          )
           return res.status(200).send('OK')
         }
 
@@ -243,9 +296,16 @@ module.exports = async (req, res) => {
           'POST',
           { session_id: session.id, role: 'admin', content: text, tg_message_id: replyToId },
         )
-        await sendMessage(OWNER_CHAT_ID, '✅ Ответ отправлен в чат на сайте', {
+        await sendMessage(replierChatId, '✅ Ответ отправлен в чат на сайте', {
           reply_to_message_id: message.message_id,
         }, sessionBotToken)
+        // Broadcast to the OTHER owner so both Daniil and Sergey see the conversation.
+        const replierLabel = replierChatId === OWNER_CHAT_ID ? 'Daniil' : 'Сергей'
+        await broadcastToOtherOwners(
+          `💬 <b>${replierLabel} ответил клиенту</b> (сессия ${session.id.slice(0, 8)}):\n\n${htmlEsc(text)}`,
+          replierChatId,
+          sessionBotToken,
+        )
         return res.status(200).send('OK')
       }
     }
