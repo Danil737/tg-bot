@@ -162,9 +162,9 @@ function classifyAttribution(attr) {
     else if (/2gis/.test(h)) label = '2ГИС'
     else if (/avito/.test(h)) label = 'Avito'
     else label = 'переход с ' + (h || 'др. сайта')
-    return '🔎 Источник: ' + label
+    return '🔎 Пришёл с: ' + label
   }
-  return '🔗 Источник: прямой заход (закладка / прямой ввод адреса)'
+  return '🔗 Пришёл напрямую (закладка / прямой ввод адреса)'
 }
 
 // MarkdownV2-блок: строка источника + страница первого захода (intent).
