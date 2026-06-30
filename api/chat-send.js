@@ -9,7 +9,7 @@
 //   4. Save user message → Groq (with retry+jitter+timeout) → save AI reply
 //   5. If AI says escalation marker → notify owner in TG, mark session escalated
 
-const { isValidUuid, fetchWithTimeout, safeLog } = require('./_lib')
+const { isValidUuid, fetchWithTimeout, safeLog, getClientMeta, clientMetaBlockMd } = require('./_lib')
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fxxmhnmvttvfatdlxpxk.supabase.co'
 const SUPABASE_SECRET = process.env.SUPABASE_SECRET_KEY
@@ -266,17 +266,21 @@ function encodeExtraOwners(extraMsgIds) {
   return 'extra:' + extraMsgIds.map(e => `${e.chat_id}:${e.message_id}`).join(';')
 }
 
-async function notifyOwnerEscalation(session, history, site = 'uhod-mogil') {
+async function notifyOwnerEscalation(session, history, site = 'uhod-mogil', meta = null) {
   const dialogue = history
     .map((m) => {
       const tag = m.role === 'user' ? '👤' : m.role === 'ai' ? '🤖' : '👨‍💼'
       return `${tag} ${m.content}`
     })
     .join('\n\n')
+  const page = escapeMd(String(session.source_url || siteLabel(site)).replace(/^https?:\/\//, ''))
+  const metaBlock = clientMetaBlockMd(meta, { page: false })
   const text =
     `🆕 *НОВЫЙ ЧАТ — ${escapeMd(siteLabel(site))}*  \\(${escapeMd(session.id.slice(0, 8))}\\)\n\n` +
-    `_Источник:_ ${escapeMd(session.source_url || siteLabel(site))}\n\n` +
-    `*Диалог:*\n${escapeMd(dialogue).slice(0, 3500)}\n\n` +
+    `💬 *Источник:* чат на сайте\n` +
+    `🌐 *Страница:* ${page}\n` +
+    (metaBlock ? metaBlock + '\n' : '') +
+    `\n*Диалог:*\n${escapeMd(dialogue).slice(0, 3500)}\n\n` +
     `_Ответь на это сообщение \\(reply\\) — клиент увидит на сайте\\._`
   const result = await tgSendOwner(text, site)
   if (!result) return null
@@ -314,6 +318,8 @@ module.exports = async (req, res) => {
     const { sessionId: incomingSessionId, token: incomingToken, message, sourceUrl, userAgent } = req.body || {}
     // Detect site from sourceUrl; falls back to Origin header for safety.
     const site = detectSite(sourceUrl || req.headers.origin || '')
+    // Geo/device/IP клиента из заголовков Vercel (без вопросов клиенту) — для уведомления владельцу.
+    const clientMeta = getClientMeta(req)
 
     if (!message || typeof message !== 'string' || !message.trim()) {
       return res.status(400).json({ ok: false, error: 'Empty message' })
@@ -360,7 +366,7 @@ module.exports = async (req, res) => {
       session.status = 'escalated'
       if (botTokenForSite(site)) {
         const fullHistory = await getRecentMessages(session.id, 30)
-        await notifyOwnerEscalation(session, fullHistory, site)
+        await notifyOwnerEscalation(session, fullHistory, site, clientMeta)
       }
       return res.status(200).json({
         ok: true,
@@ -425,7 +431,7 @@ module.exports = async (req, res) => {
       try { await setSessionEscalated(session.id, session.tg_root_message_id || 0) } catch (e) { console.error('escalate status set failed:', e.message) }
       if (botTokenForSite(site)) {
         const fullHistory = await getRecentMessages(session.id, 30)
-        await notifyOwnerEscalation(session, fullHistory, site)
+        await notifyOwnerEscalation(session, fullHistory, site, clientMeta)
       }
     }
 

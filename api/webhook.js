@@ -377,6 +377,8 @@ module.exports = async (req, res) => {
     }
 
     const usernameLine = from.username ? `📎 @${htmlEsc(from.username)}\n` : ''
+    const langLine = from.language_code ? `🗣 Язык: ${htmlEsc(from.language_code)}\n` : ''
+    const tgSourceLine = `✈️ Источник: Telegram-бот (напрямую)\n`
     const botLabel = incomingBot === 'kmh' ? 'Kiss My Hands' : 'УходМогил'
 
     // Если клиент прислал фото — пересылаем тебе в TG как уведомление (через тот же бот)
@@ -386,8 +388,9 @@ module.exports = async (req, res) => {
         OWNER_CHAT_ID,
         largestPhoto.file_id,
         `📨 <b>Фото от клиента — ${botLabel}</b>\n\n` +
+          tgSourceLine +
           `👤 ${htmlEsc(name)}\n` +
-          usernameLine +
+          usernameLine + langLine +
           (caption ? `💬 ${htmlEsc(caption)}\n\n` : '') +
           `chatid: ${chatId}\n\n` +
           `↩️ <i>Ответ на это сообщение (включая фото) — пересылается клиенту</i>`,
@@ -400,8 +403,9 @@ module.exports = async (req, res) => {
     await sendMessage(
       OWNER_CHAT_ID,
       `📨 <b>Новое сообщение от клиента — ${botLabel}</b>\n\n` +
+        tgSourceLine +
         `👤 Имя: ${htmlEsc(name)}\n` +
-        usernameLine +
+        usernameLine + langLine +
         `💬 Сообщение: ${htmlEsc(text)}\n\n` +
         `chatid: ${chatId}\n\n` +
         `↩️ <i>Нажми "Ответить" на это сообщение чтобы написать клиенту</i>`,

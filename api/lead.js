@@ -4,7 +4,7 @@
 //   • main contact form (type='lead') — заявка на услугу
 //   • review form         (type='review') — пользовательский отзыв на модерацию
 
-const { fetchWithTimeout } = require('./_lib')
+const { fetchWithTimeout, getClientMeta, clientMetaBlockMd } = require('./_lib')
 
 const OWNER_CHAT_ID = parseInt(process.env.OWNER_CHAT_ID || '696698928', 10)
 const BOT_TOKEN = process.env.BOT_TOKEN
@@ -131,16 +131,21 @@ module.exports = async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Имя и текст отзыва обязательны' })
     }
 
+    // Geo/device/IP клиента из заголовков Vercel (без вопросов клиенту).
+    const metaBlock = clientMetaBlockMd(getClientMeta(req), { page: true })
+
     let text = ''
     if (type === 'lead') {
       text =
         `🆕 *Новая заявка с сайта uhod\\-mogil\\.ru*\n\n` +
+        `📝 *Источник:* форма заявки на сайте\n` +
         `👤 *Имя:* ${escapeMd(name)}\n` +
         `📞 *Контакт:* ${escapeMd(contact)}\n` +
         (service ? `🛠 *Услуга:* ${escapeMd(service)}\n` : '') +
         (cemetery ? `📍 *Кладбище:* ${escapeMd(cemetery)}\n` : '') +
         (message ? `\n💬 *Комментарий:*\n${escapeMd(message)}\n` : '') +
-        `\n_источник: ${escapeMd(source)}_`
+        (metaBlock ? `\n${metaBlock}\n` : '') +
+        `\n_тех\\. источник: ${escapeMd(source)}_`
     } else if (type === 'review') {
       const stars = '⭐'.repeat(Math.max(1, Math.min(5, rating)))
       text =
