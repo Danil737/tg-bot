@@ -113,7 +113,73 @@ function clientMetaBlockMd(meta, opts = {}) {
   return lines.join('\n')
 }
 
+// --- Traffic-source attribution (first-touch) ---
+// Frontend (lib/attribution.ts) присылает СЫРЬЁ {referrer, utm_*, landing}. Классификация — здесь,
+// одна точка правды: можно улучшать без передеплоя сайта.
+function _host(u) {
+  try { return new URL(u).hostname.replace(/^www\./, '') } catch { return '' }
+}
+const _UTM_SRC = {
+  google: 'Google Ads', yandex: 'Яндекс Директ', vk: 'ВКонтакте', vkontakte: 'ВКонтакте',
+  telegram: 'Telegram', tg: 'Telegram', facebook: 'Facebook', fb: 'Facebook',
+  instagram: 'Instagram', ig: 'Instagram', mytarget: 'myTarget', email: 'Email-рассылка',
+  newsletter: 'Email-рассылка', avito: 'Avito', '2gis': '2ГИС',
+}
+const _UTM_MED = {
+  cpc: 'реклама', ppc: 'реклама', paid: 'реклама', cpm: 'реклама', banner: 'баннер',
+  email: 'рассылка', social: 'соцсети', organic: 'органика', referral: 'переход',
+}
+
+// Возвращает человекочитаемую строку источника привлечения (или null).
+function classifyAttribution(attr) {
+  if (!attr || typeof attr !== 'object') return null
+  const utmSource = String(attr.utm_source || '').toLowerCase().trim()
+  const utmMedium = String(attr.utm_medium || '').toLowerCase().trim()
+  const utmCampaign = String(attr.utm_campaign || '').trim().slice(0, 60)
+  if (utmSource) {
+    const srcLabel = _UTM_SRC[utmSource] || (utmSource.charAt(0).toUpperCase() + utmSource.slice(1))
+    const medLabel = _UTM_MED[utmMedium] || utmMedium
+    let s = '🎯 Реклама: ' + srcLabel
+    if (medLabel) s += ` (${medLabel})`
+    if (utmCampaign) s += ` · кампания «${utmCampaign}»`
+    return s
+  }
+  const ref = String(attr.referrer || '')
+  if (ref) {
+    const h = _host(ref)
+    let label
+    if (/google\./.test(h)) label = 'Google (поиск)'
+    else if (/yandex\.|ya\.ru/.test(h)) label = 'Яндекс (поиск)'
+    else if (/bing\./.test(h)) label = 'Bing (поиск)'
+    else if (/duckduckgo/.test(h)) label = 'DuckDuckGo'
+    else if (/mail\.ru/.test(h)) label = 'Mail.ru (поиск)'
+    else if (/rambler/.test(h)) label = 'Rambler'
+    else if (/(^|\.)t\.me$|telegram/.test(h)) label = 'Telegram'
+    else if (/vk\.com|vk\.ru/.test(h)) label = 'ВКонтакте'
+    else if (/dzen\.|zen\.yandex/.test(h)) label = 'Дзен'
+    else if (/(youtube|youtu\.be)/.test(h)) label = 'YouTube'
+    else if (/pinterest/.test(h)) label = 'Pinterest'
+    else if (/2gis/.test(h)) label = '2ГИС'
+    else if (/avito/.test(h)) label = 'Avito'
+    else label = 'переход с ' + (h || 'др. сайта')
+    return '🔎 Источник: ' + label
+  }
+  return '🔗 Источник: прямой заход (закладка / прямой ввод адреса)'
+}
+
+// MarkdownV2-блок: строка источника + страница первого захода (intent).
+function attributionLineMd(attr) {
+  const label = classifyAttribution(attr)
+  if (!label) return ''
+  const esc = (s) => String(s || '').replace(/[*_`\[\]()~>#+=|{}.!-]/g, '\\$&')
+  let out = esc(label)
+  const landing = attr && attr.landing ? String(attr.landing) : ''
+  if (landing && landing !== '/') out += `\n↳ зашёл на: ${esc(landing.slice(0, 120))}`
+  return out
+}
+
 module.exports = {
   isValidUuid, fetchWithTimeout, safeLog, UUID_RE,
   getClientMeta, clientMetaBlockMd, parseUserAgent,
+  classifyAttribution, attributionLineMd,
 }

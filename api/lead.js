@@ -4,7 +4,7 @@
 //   • main contact form (type='lead') — заявка на услугу
 //   • review form         (type='review') — пользовательский отзыв на модерацию
 
-const { fetchWithTimeout, getClientMeta, clientMetaBlockMd } = require('./_lib')
+const { fetchWithTimeout, getClientMeta, clientMetaBlockMd, attributionLineMd } = require('./_lib')
 
 const OWNER_CHAT_ID = parseInt(process.env.OWNER_CHAT_ID || '696698928', 10)
 const BOT_TOKEN = process.env.BOT_TOKEN
@@ -131,8 +131,10 @@ module.exports = async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Имя и текст отзыва обязательны' })
     }
 
-    // Geo/device/IP клиента из заголовков Vercel (без вопросов клиенту).
+    // Geo/device/IP + источник трафика клиента (всё авто, без вопросов клиенту).
     const metaBlock = clientMetaBlockMd(getClientMeta(req), { page: true })
+    const attribLine = attributionLineMd(body.attribution)
+    const infoBlock = [metaBlock, attribLine].filter(Boolean).join('\n')
 
     let text = ''
     if (type === 'lead') {
@@ -144,7 +146,7 @@ module.exports = async (req, res) => {
         (service ? `🛠 *Услуга:* ${escapeMd(service)}\n` : '') +
         (cemetery ? `📍 *Кладбище:* ${escapeMd(cemetery)}\n` : '') +
         (message ? `\n💬 *Комментарий:*\n${escapeMd(message)}\n` : '') +
-        (metaBlock ? `\n${metaBlock}\n` : '') +
+        (infoBlock ? `\n${infoBlock}\n` : '') +
         `\n_тех\\. источник: ${escapeMd(source)}_`
     } else if (type === 'review') {
       const stars = '⭐'.repeat(Math.max(1, Math.min(5, rating)))
