@@ -8,6 +8,12 @@ const { fetchWithTimeout } = require('./_lib')
 const OWNER_CHAT_ID = parseInt(process.env.OWNER_CHAT_ID || '696698928', 10)
 const BOT_TOKEN = process.env.BOT_TOKEN
 
+// Экранирование для parse_mode:'HTML' (audit uhod#2): '<' в имени/контакте/услуге
+// ломал разбор entities → sendPhoto падал 500 → фото молча терялось.
+function htmlEsc(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
 const ALLOWED_ORIGINS = ['https://uhod-mogil.ru', 'https://www.uhod-mogil.ru', 'http://localhost:3000']
 
 function setCors(req, res) {
@@ -73,9 +79,9 @@ module.exports = async (req, res) => {
     // Build caption for Telegram
     const tgCaption = [
       '<b>📸 Фото к заявке (uhod-mogil.ru)</b>',
-      caption ? `\n💬 ${caption}` : '',
-      service ? `\n🔧 Услуга: ${service}` : '',
-      cemetery ? `\n🪦 Кладбище: ${cemetery}` : '',
+      caption ? `\n💬 ${htmlEsc(caption)}` : '',
+      service ? `\n🔧 Услуга: ${htmlEsc(service)}` : '',
+      cemetery ? `\n🪦 Кладбище: ${htmlEsc(cemetery)}` : '',
     ].filter(Boolean).join('')
 
     // Send to Telegram
