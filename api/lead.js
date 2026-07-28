@@ -101,6 +101,55 @@ async function sendToOwner(text, replyMarkup) {
   return data.ok
 }
 
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fxxmhnmvttvfatdlxpxk.supabase.co'
+const SUPABASE_SECRET = process.env.SUPABASE_SECRET_KEY
+
+/**
+ * Заявка → таблица uhod_clients, её читает панель /uhod в боте.
+ * Намеренно «мягкая»: любая ошибка записи логируется, но НЕ ломает ответ клиенту —
+ * заявка уже доставлена в Telegram, и терять её из-за проблемы с базой нельзя.
+ */
+async function saveLeadToCrm({ name, contact, service, cemetery, message, source, body, req }) {
+  if (!SUPABASE_SECRET) {
+    console.error('[crm] SUPABASE_SECRET_KEY не задан — заявка не сохранена в CRM')
+    return
+  }
+  try {
+    const row = {
+      name: name || null,
+      contact: contact || null,
+      service: service || null,
+      cemetery: cemetery || null,
+      message: message || null,
+      source: source && source !== 'site' ? source : 'сайт',
+      status: 'вопрос',
+      raw: {
+        page: body.page || null,
+        attribution: body.attribution || null,
+        ua: (req.headers['user-agent'] || '').slice(0, 300),
+        ip: (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || null,
+        received_at: new Date().toISOString(),
+      },
+    }
+    const r = await fetchWithTimeout(`${SUPABASE_URL}/rest/v1/uhod_clients`, {
+      method: 'POST',
+      headers: {
+        apikey: SUPABASE_SECRET,
+        Authorization: `Bearer ${SUPABASE_SECRET}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify(row),
+    }, 6000)
+    if (!r.ok) {
+      const t = await r.text()
+      console.error(`[crm] insert ${r.status}: ${t.slice(0, 200)}`)
+    }
+  } catch (e) {
+    console.error('[crm] insert failed:', e && e.message)
+  }
+}
+
 module.exports = async (req, res) => {
   setCors(req, res)
   if (req.method === 'OPTIONS') return res.status(204).end()
@@ -172,6 +221,13 @@ module.exports = async (req, res) => {
 
     const ok = await sendToOwner(text, replyMarkup)
     if (!ok) return res.status(500).json({ ok: false, error: 'Telegram delivery failed' })
+
+    // Пишем заявку в CRM (панель /uhod в @my_claudebot_bot). Раньше заявка жила
+    // только как сообщение в Telegram: пролистал — и клиент потерян.
+    // Отзывы в CRM не кладём — это не заявка на работу.
+    if (type === 'lead') {
+      await saveLeadToCrm({ name, contact, service, cemetery, message, source, body, req })
+    }
 
     return res.status(200).json({ ok: true })
   } catch (e) {
