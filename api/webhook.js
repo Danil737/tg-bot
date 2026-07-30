@@ -86,6 +86,87 @@ async function sendPhoto(chatId, photoUrl, caption = '', botToken = BOT_TOKEN) {
   return data
 }
 
+// Подтверждение доставки реакцией, а не отдельным сообщением: каждый ответ владельца
+// иначе плодит "✅ Ответ отправлен клиенту" и лента чата превращается в спам (30.07.2026).
+// "✅" в список реакций Telegram не входит — используем 👌 из стандартного набора.
+async function reactOk(chatId, messageId, botToken = BOT_TOKEN) {
+  try {
+    const res = await fetchWithTimeout(
+      `https://api.telegram.org/bot${botToken}/setMessageReaction`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: messageId,
+          reaction: [{ type: 'emoji', emoji: '👌' }],
+        }),
+      },
+      6000,
+    )
+    const data = await res.json()
+    safeLog('setMessageReaction.ok=' + data.ok, { ok: data.ok, description: data.description })
+    return data.ok
+  } catch (e) {
+    safeLog('setMessageReaction failed', { err: e.message })
+    return false
+  }
+}
+
+// Ресенд любого вложения по file_id — внутри TG файл качать не нужно.
+async function sendMediaByFileId(chatId, method, field, fileId, caption = '', botToken = BOT_TOKEN) {
+  const res = await fetchWithTimeout(
+    `https://api.telegram.org/bot${botToken}/${method}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, [field]: fileId, caption, parse_mode: 'HTML' }),
+    },
+    10000,
+  )
+  const data = await res.json()
+  safeLog(`${method}.ok=` + data.ok, { ok: data.ok, error_code: data.error_code, description: data.description })
+  return data
+}
+
+// Для типов без caption (кружок, стикер, гео) — копия сообщения как есть.
+async function copyMessage(toChatId, fromChatId, messageId, botToken = BOT_TOKEN) {
+  const res = await fetchWithTimeout(
+    `https://api.telegram.org/bot${botToken}/copyMessage`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: toChatId, from_chat_id: fromChatId, message_id: messageId }),
+    },
+    10000,
+  )
+  const data = await res.json()
+  safeLog('copyMessage.ok=' + data.ok, { ok: data.ok, error_code: data.error_code, description: data.description })
+  return data
+}
+
+// Клиент присылает вложение не только как сжатое фото: вставка картинки из буфера
+// в Telegram Desktop/Web уходит как document image.png. Раньше ловился только
+// message.photo — document проваливался в текстовую ветку, где text пустой,
+// и владелец получал уведомление с пустым "Сообщение:" вместо файла (30.07.2026).
+function detectAttachment(m) {
+  if (Array.isArray(m.photo) && m.photo.length > 0) {
+    return { method: 'sendPhoto', field: 'photo', fileId: m.photo[m.photo.length - 1].file_id, label: 'Фото' }
+  }
+  if (m.document) {
+    const nm = m.document.file_name ? ` (${m.document.file_name})` : ''
+    return { method: 'sendDocument', field: 'document', fileId: m.document.file_id, label: `Файл${nm}` }
+  }
+  if (m.video) return { method: 'sendVideo', field: 'video', fileId: m.video.file_id, label: 'Видео' }
+  if (m.voice) return { method: 'sendVoice', field: 'voice', fileId: m.voice.file_id, label: 'Голосовое' }
+  if (m.audio) return { method: 'sendAudio', field: 'audio', fileId: m.audio.file_id, label: 'Аудио' }
+  if (m.video_note) return { method: null, label: 'Видео-кружок' }
+  if (m.sticker) return { method: null, label: 'Стикер' }
+  if (m.location) return { method: null, label: 'Геолокация' }
+  if (m.contact) return { method: null, label: 'Контакт' }
+  return null
+}
+
 async function sb(path, method = 'GET', body = null, prefer = '') {
   if (!SUPABASE_SECRET) return null
   const headers = {
@@ -266,20 +347,9 @@ module.exports = async (req, res) => {
             },
           )
 
-          // Для альбома: проверяем сколько фото уже загружено, шлём только короткое подтверждение
-          if (mediaGroupId) {
-            const groupRows = await sb(
-              `web_chat_messages?session_id=eq.${session.id}&media_group_id=eq.${mediaGroupId}&select=id`,
-            )
-            const groupCount = groupRows?.length || 1
-            await sendMessage(replierChatId, `📷 ${groupCount}`, {
-              reply_to_message_id: message.message_id,
-            }, sessionBotToken)
-          } else {
-            await sendMessage(replierChatId, '✅ Фото отправлено клиенту в чат на сайте', {
-              reply_to_message_id: message.message_id,
-            }, sessionBotToken)
-          }
+          // Подтверждение — реакцией на само сообщение владельца (и для альбома тоже:
+          // иначе каждое фото из альбома отвечало отдельной строкой)
+          await reactOk(replierChatId, message.message_id, sessionBotToken)
           // Broadcast photo notification to the other owner (без файла — у них уже было уведомление)
           const replierLabel = replierChatId === OWNER_CHAT_ID ? 'Daniil' : 'Сергей'
           await broadcastToOtherOwners(
@@ -296,9 +366,7 @@ module.exports = async (req, res) => {
           'POST',
           { session_id: session.id, role: 'admin', content: text, tg_message_id: replyToId },
         )
-        await sendMessage(replierChatId, '✅ Ответ отправлен в чат на сайте', {
-          reply_to_message_id: message.message_id,
-        }, sessionBotToken)
+        await reactOk(replierChatId, message.message_id, sessionBotToken)
         // Broadcast to the OTHER owner so both Daniil and Sergey see the conversation.
         const replierLabel = replierChatId === OWNER_CHAT_ID ? 'Daniil' : 'Сергей'
         await broadcastToOtherOwners(
@@ -320,25 +388,37 @@ module.exports = async (req, res) => {
       if (hasPhoto) {
         // Для TG-клиента используем file_id напрямую — TG умеет ресенд по file_id, не нужно скачивать
         const largestPhoto = message.photo[message.photo.length - 1]
-        await sendPhoto(
+        const sent = await sendPhoto(
           customerChatId,
           largestPhoto.file_id,
           caption ? `💬 <b>${managerLabel}:</b>\n${htmlEsc(caption)}` : '',
           incomingBotToken,
         )
-        await sendMessage(OWNER_CHAT_ID, mediaGroupId ? '📷' : '✅ Фото отправлено клиенту', {
-          reply_to_message_id: message.message_id,
-        }, incomingBotToken)
+        // Отдельной строки "отправлено" больше нет — только реакция. Текстом отвечаем
+        // лишь на провал: раньше подтверждение слалось безусловно и врало при ошибке.
+        if (sent.ok) {
+          await reactOk(replierChatId, message.message_id, incomingBotToken)
+        } else {
+          await sendMessage(replierChatId, `⚠️ Фото не доставлено: ${htmlEsc(sent.description || 'ошибка Telegram')}`, {
+            reply_to_message_id: message.message_id,
+          }, incomingBotToken)
+        }
         return res.status(200).send('OK')
       }
 
-      await sendMessage(
+      const sentText = await sendMessage(
         customerChatId,
         `💬 <b>${managerLabel}:</b>\n${htmlEsc(text)}`,
         {},
         incomingBotToken,
       )
-      await sendMessage(OWNER_CHAT_ID, '✅ Ответ отправлен клиенту', {}, incomingBotToken)
+      if (sentText.ok) {
+        await reactOk(replierChatId, message.message_id, incomingBotToken)
+      } else {
+        await sendMessage(replierChatId, `⚠️ Ответ не доставлен: ${htmlEsc(sentText.description || 'ошибка Telegram')}`, {
+          reply_to_message_id: message.message_id,
+        }, incomingBotToken)
+      }
     }
     return res.status(200).send('OK')
   }
@@ -381,21 +461,38 @@ module.exports = async (req, res) => {
     const tgSourceLine = `✈️ Источник: Telegram-бот (напрямую)\n`
     const botLabel = incomingBot === 'kmh' ? 'Kiss My Hands' : 'УходМогил'
 
-    // Если клиент прислал фото — пересылаем тебе в TG как уведомление (через тот же бот)
-    if (Array.isArray(message.photo) && message.photo.length > 0) {
-      const largestPhoto = message.photo[message.photo.length - 1]
-      await sendPhoto(
-        OWNER_CHAT_ID,
-        largestPhoto.file_id,
-        `📨 <b>Фото от клиента — ${botLabel}</b>\n\n` +
-          tgSourceLine +
-          `👤 ${htmlEsc(name)}\n` +
-          usernameLine + langLine +
-          (caption ? `💬 ${htmlEsc(caption)}\n\n` : '') +
-          `chatid: ${chatId}\n\n` +
-          `↩️ <i>Ответ на это сообщение (включая фото) — пересылается клиенту</i>`,
-        incomingBotToken,
-      )
+    // Если клиент прислал вложение (фото / файл / видео / голосовое) — пересылаем
+    // тебе в TG как уведомление (через тот же бот)
+    const att = detectAttachment(message)
+    if (att) {
+      const info =
+        `📨 <b>${htmlEsc(att.label)} от клиента — ${botLabel}</b>\n\n` +
+        tgSourceLine +
+        `👤 ${htmlEsc(name)}\n` +
+        usernameLine + langLine +
+        (caption ? `💬 ${htmlEsc(caption)}\n\n` : '') +
+        `chatid: ${chatId}\n\n` +
+        `↩️ <i>Ответ на это сообщение (включая фото) — пересылается клиенту</i>`
+
+      let delivered = false
+      if (att.method) {
+        const r = await sendMediaByFileId(OWNER_CHAT_ID, att.method, att.field, att.fileId, info, incomingBotToken)
+        delivered = !!r.ok
+      } else {
+        // кружок/стикер/гео: caption не поддерживается — копия + отдельная карточка с chatid
+        const r = await copyMessage(OWNER_CHAT_ID, chatId, message.message_id, incomingBotToken)
+        delivered = !!r.ok
+        if (delivered) await sendMessage(OWNER_CHAT_ID, info, {}, incomingBotToken)
+      }
+
+      // Вложение не доехало — владелец обязан узнать о сообщении, иначе лид теряется молча.
+      if (!delivered) {
+        await sendMessage(
+          OWNER_CHAT_ID,
+          info + `\n\n⚠️ <i>Вложение переслать не удалось — открой чат клиента вручную</i>`,
+          {}, incomingBotToken,
+        )
+      }
       return res.status(200).send('OK')
     }
 
@@ -406,7 +503,7 @@ module.exports = async (req, res) => {
         tgSourceLine +
         `👤 Имя: ${htmlEsc(name)}\n` +
         usernameLine + langLine +
-        `💬 Сообщение: ${htmlEsc(text)}\n\n` +
+        `💬 Сообщение: ${htmlEsc(text) || '<i>(без текста)</i>'}\n\n` +
         `chatid: ${chatId}\n\n` +
         `↩️ <i>Нажми "Ответить" на это сообщение чтобы написать клиенту</i>`,
       {}, incomingBotToken,
