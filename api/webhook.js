@@ -52,6 +52,37 @@ async function broadcastToOtherOwners(text, fromChatId, botToken) {
   }
 }
 
+// CRM (РФ-сервер): складываем переписку в карточку клиента, чтобы история жила не в ленте
+// уведомлений, а рядом с заказом. Пересылка владельцу при этом остаётся как была.
+//
+// Главное свойство: CRM НЕ должна ломать бота. Короткий таймаут, ошибки глушим —
+// если CRM недоступна, сообщение клиента всё равно доедет до владельца. Обратный порядок
+// (сначала CRM, потом уведомление) означал бы, что падение CRM = молча потерянный лид.
+const CRM_URL = process.env.CRM_URL || ''
+const CRM_SECRET = process.env.CRM_SECRET || ''
+
+async function crmIngest(payload) {
+  if (!CRM_URL || !CRM_SECRET) return
+  try {
+    const ctrl = new AbortController()
+    const kill = setTimeout(() => ctrl.abort(), 3500)
+    const r = await fetch(CRM_URL.replace(/\/+$/, '') + '/api/ingest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CRM-Secret': CRM_SECRET },
+      body: JSON.stringify(payload),
+      signal: ctrl.signal,
+    })
+    clearTimeout(kill)
+    safeLog('crm.ingest=' + r.status, { status: r.status })
+  } catch (e) {
+    safeLog('crm.ingest.fail', { error: String(e && e.message || e).slice(0, 120) })
+  }
+}
+
+function crmProject(bot) {
+  return bot === 'kmh' ? 'kissmyhands' : 'uhod-mogil'
+}
+
 function htmlEsc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
@@ -398,6 +429,18 @@ module.exports = async (req, res) => {
         // лишь на провал: раньше подтверждение слалось безусловно и врало при ошибке.
         if (sent.ok) {
           await reactOk(replierChatId, message.message_id, incomingBotToken)
+          // Ответ владельца из телеграма тоже должен попасть в карточку, иначе в CRM
+          // будет видна только половина разговора.
+          await crmIngest({
+            project_id: crmProject(incomingBot),
+            tg_chat_id: customerChatId,
+            direction: 'out',
+            text: caption || '',
+            media_kind: 'photo',
+            media_ref: largestPhoto.file_id,
+            author_label: managerLabel,
+            source: 'telegram',
+          })
         } else {
           await sendMessage(replierChatId, `⚠️ Фото не доставлено: ${htmlEsc(sent.description || 'ошибка Telegram')}`, {
             reply_to_message_id: message.message_id,
@@ -414,6 +457,14 @@ module.exports = async (req, res) => {
       )
       if (sentText.ok) {
         await reactOk(replierChatId, message.message_id, incomingBotToken)
+        await crmIngest({
+          project_id: crmProject(incomingBot),
+          tg_chat_id: customerChatId,
+          direction: 'out',
+          text: text || '',
+          author_label: managerLabel,
+          source: 'telegram',
+        })
       } else {
         await sendMessage(replierChatId, `⚠️ Ответ не доставлен: ${htmlEsc(sentText.description || 'ошибка Telegram')}`, {
           reply_to_message_id: message.message_id,
@@ -493,6 +544,17 @@ module.exports = async (req, res) => {
           {}, incomingBotToken,
         )
       }
+      await crmIngest({
+        project_id: crmProject(incomingBot),
+        tg_chat_id: chatId,
+        tg_username: from.username || null,
+        name: name || null,
+        text: caption || '',
+        media_kind: att.label || 'attachment',
+        media_ref: att.fileId || null,
+        tg_msg_id: message.message_id,
+        source: 'telegram',
+      })
       return res.status(200).send('OK')
     }
 
@@ -508,6 +570,15 @@ module.exports = async (req, res) => {
         `↩️ <i>Нажми "Ответить" на это сообщение чтобы написать клиенту</i>`,
       {}, incomingBotToken,
     )
+    await crmIngest({
+      project_id: crmProject(incomingBot),
+      tg_chat_id: chatId,
+      tg_username: from.username || null,
+      name: name || null,
+      text: text || '',
+      tg_msg_id: message.message_id,
+      source: 'telegram',
+    })
   }
 
   res.status(200).send('OK')
