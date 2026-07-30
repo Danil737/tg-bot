@@ -160,7 +160,7 @@ async function saveLeadToCrm({ name, contact, service, cemetery, message, source
 const CRM_URL = process.env.CRM_URL || ''
 const CRM_SECRET = process.env.CRM_SECRET || ''
 
-async function saveLeadToRuCrm({ name, contact, service, cemetery, message, source }) {
+async function saveLeadToRuCrm({ name, contact, service, cemetery, message, source, page }) {
   if (!CRM_URL || !CRM_SECRET) return
   try {
     const r = await fetchWithTimeout(`${CRM_URL.replace(/\/+$/, '')}/api/lead`, {
@@ -174,6 +174,9 @@ async function saveLeadToRuCrm({ name, contact, service, cemetery, message, sour
         cemetery: cemetery || null,
         message: message || null,
         source: source || 'uhod-mogil.ru/zayavka',
+        // Страница, с которой отправили форму: «уборка» и «памятники» — разговоры
+        // с разного места, и оператору полезно знать, откуда человек пришёл.
+        landing: page || null,
       }),
     }, 5000)
     if (!r.ok) console.error(`[ru-crm] lead ${r.status}: ${(await r.text()).slice(0, 160)}`)
@@ -259,7 +262,7 @@ module.exports = async (req, res) => {
     // Отзывы в CRM не кладём — это не заявка на работу.
     if (type === 'lead') {
       await saveLeadToCrm({ name, contact, service, cemetery, message, source, body, req })
-      await saveLeadToRuCrm({ name, contact, service, cemetery, message, source })
+      await saveLeadToRuCrm({ name, contact, service, cemetery, message, source, page: body.page || null })
     }
 
     return res.status(200).json({ ok: true })
