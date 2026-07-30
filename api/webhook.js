@@ -104,9 +104,10 @@ async function crmGrave(payload) {
   }
 }
 
-// Выписка из ОТКРЫТОГО реестра. Формулировки намеренно осторожные: назначить человеку
-// могилу автоматом нельзя, ошибка тут дороже пользы. Больше трёх совпадений не
-// показываем — дальше это уже разговор с оператором.
+// Выписка из ОТКРЫТОГО реестра — ДЛЯ ВЛАДЕЛЬЦА, не для клиента.
+// Автомат не должен объявлять человеку, где лежит его дед: совпадение по ФИО это ещё
+// не та могила, а цена ошибки тут несоизмерима с экономией одного сообщения. Владелец
+// смотрит выписку, при необходимости уточняет год рождения или участок — и отвечает сам.
 function graveReply(g) {
   if (!g || !g.ok || !g.results || !g.results.length) return null
   const rows = g.results.map((r) => {
@@ -121,9 +122,7 @@ function graveReply(g) {
   const more = g.total > g.results.length
     ? `\n\nВсего совпадений: ${g.total}, показаны первые ${g.results.length}.`
     : ''
-  return `🔎 <b>Нашлось в открытом реестре захоронений</b>\n\n${rows.join('\n\n')}${more}\n\n` +
-    '<i>Это совпадение по ФИО из открытого реестра, а не подтверждение. ' +
-    'Точное место проверим при выезде и пришлём фото.</i>'
+  return `🔎 <b>Реестр захоронений — по сообщению клиента</b>\n\n${rows.join('\n\n')}${more}`
 }
 
 function crmProject(bot) {
@@ -592,9 +591,7 @@ module.exports = async (req, res) => {
         '✅ Выезд 1–3 дня\n' +
         '✅ Цены от 3 000 ₽\n\n' +
         'Напишите нам — на каком кладбище нужна уборка и что сделать. Ответим быстро!\n\n' +
-        '🔎 <b>Не знаете, где похоронен близкий?</b> Отправьте команду\n' +
-        '<code>/mogila Фамилия Имя Отчество, кладбище</code>\n' +
-        'и мы поищем участок в открытом реестре захоронений Москвы.\n\n' +
+        '🔎 Не знаете, где похоронен близкий? Напишите ФИО и кладбище — поищем и ответим.\n\n' +
         '🌐 Сайт: https://uhod-mogil.ru\n' +
         '📢 Наш канал с фотоотчётами и календарём поминальных дней: <a href="https://t.me/uhod_mogil">t.me/uhod_mogil</a>',
         {}, incomingBotToken,
@@ -613,42 +610,6 @@ module.exports = async (req, res) => {
       return res.status(200).send('OK')
     }
 
-    // Явный поиск захоронения: /mogila Фамилия Имя Отчество, кладбище
-    if (/^\/mogila|^\/grave/i.test(text)) {
-      const q = text.replace(/^\/\w+(@\w+)?\s*/i, '').trim()
-      if (q.length < 5) {
-        await sendMessage(chatId,
-          'Напишите так:\n<code>/mogila Иванов Иван Иванович, Троекуровское</code>\n\n' +
-          'Кладбище можно не указывать — тогда поищем по всем московским.',
-          {}, incomingBotToken)
-        return res.status(200).send('OK')
-      }
-      const g = await crmGrave({
-        project_id: crmProject(incomingBot),
-        tg_chat_id: chatId,
-        tg_username: from.username || null,
-        name: name || null,
-        text: q,
-      })
-      const reply = graveReply(g)
-      await sendMessage(chatId,
-        reply ||
-        (g && g.need === 'fio'
-          ? 'Не разобрал имя. Нужны хотя бы фамилия и имя: <code>/mogila Иванов Иван, Хованское</code>'
-          : 'По этому запросу в открытом реестре ничего не нашлось. ' +
-            'Попробуйте без отчества или без названия кладбища — а лучше напишите нам, поищем вместе.'),
-        {}, incomingBotToken)
-      // Владелец должен видеть запрос: это горячий лид, человек ищет конкретную могилу.
-      await sendMessage(OWNER_CHAT_ID,
-        `🔎 <b>Клиент искал захоронение — ${incomingBot === 'kmh' ? 'KMH' : 'УходМогил'}</b>\n\n` +
-        `👤 ${htmlEsc(name)}${from.username ? ' · @' + htmlEsc(from.username) : ''}\n` +
-        `Запрос: ${htmlEsc(q)}\n` +
-        `Результат: ${g && g.total ? g.total + ' совпадений' : 'ничего не нашлось'}\n\n` +
-        `chatid: ${chatId}\n\n` +
-        '↩️ <i>Ответьте на это сообщение, чтобы написать клиенту</i>',
-        {}, incomingBotToken)
-      return res.status(200).send('OK')
-    }
 
     const usernameLine = from.username ? `📎 @${htmlEsc(from.username)}\n` : ''
     const langLine = from.language_code ? `🗣 Язык: ${htmlEsc(from.language_code)}\n` : ''
@@ -729,11 +690,11 @@ module.exports = async (req, res) => {
       source: 'telegram',
     })
 
-    // Догадка: в обычном сообщении есть и название кладбища, и ФИО («уборка на
-    // Троекуровском, дед Колычев Анатолий Иванович»). Тогда сразу показываем участок —
-    // это ровно тот момент, когда человеку нужен ответ.
-    // quiet: не нашли или не разобрали — молчим. Непрошеное «ничего не нашлось» в ответ
-    // на обычный вопрос выглядит как поломка, а в карточке остаётся мусором.
+    // В сообщении клиента есть ФИО (и, если повезло, кладбище) — заранее поднимаем
+    // выписку из реестра и кладём ЕЁ ТЕБЕ, следом за уведомлением. Клиенту не уходит
+    // ничего: совпадение по ФИО это ещё не та могила, а сверять её с присланным фото
+    // памятника всё равно человеку. Ты решаешь, писать клиенту или сначала уточнить.
+    // quiet: не разобрали или не нашли — молчим совсем, в том числе в карточке.
     if (incomingBot !== 'kmh' && text && text.length >= 12) {
       const g = await crmGrave({
         project_id: crmProject(incomingBot),
@@ -743,12 +704,18 @@ module.exports = async (req, res) => {
         text,
         quiet: true,
       })
-      const reply = graveReply(g)
-      if (reply) {
-        await sendMessage(chatId, reply, {}, incomingBotToken)
+      const found = graveReply(g)
+      if (found) {
+        const cardLink = g.client_id && CRM_URL
+          ? `\n\n🗂 <a href="${CRM_URL.replace(/\/+$/, '')}/#c${g.client_id}">Карточка в CRM</a>` +
+            (g.photos ? ` — там же ${g.photos} фото от клиента, есть с чем сверить` : '')
+          : ''
         await sendMessage(OWNER_CHAT_ID,
-          `🔎 <i>Бот сам нашёл захоронение по сообщению клиента (${g.total} совпадений) ` +
-          `и показал его. chatid: ${chatId}</i>`,
+          `${found}\n\n` +
+          (g.cemetery ? '' : '⚠️ Кладбище в сообщении не названо — это совпадения по всей Москве.\n') +
+          `chatid: ${chatId}${cardLink}\n\n` +
+          '↩️ <i>Клиенту это НЕ отправлено. Ответьте на это сообщение, если хотите переслать ' +
+          'или уточнить — уйдёт клиенту.</i>',
           {}, incomingBotToken)
       }
     }
