@@ -9,6 +9,8 @@ const BOT_TOKEN_KMH = process.env.BOT_TOKEN_KMH                 // @KissMyHandsB
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fxxmhnmvttvfatdlxpxk.supabase.co'
 const SUPABASE_SECRET = process.env.SUPABASE_SECRET_KEY
 const WEBHOOK_SECRET = process.env.TG_WEBHOOK_SECRET
+// Тестовый ключ: пусто в норме, значение ставится только на время проверки цепочки.
+const WEBHOOK_SECRET_ALT = process.env.TG_WEBHOOK_SECRET_ALT || ''
 const PHOTOS_BUCKET = 'chat-photos'      // создать вручную в Supabase Storage (public)
 
 // Site detection from sourceUrl stored on the chat session.
@@ -283,7 +285,13 @@ module.exports = async (req, res) => {
 
   if (WEBHOOK_SECRET) {
     const provided = req.headers['x-telegram-bot-api-secret-token']
-    if (provided !== WEBHOOK_SECRET) {
+    // Второй ключ — только для проверки цепочки «вебхук -> CRM» своим запросом.
+    // Рабочий секрет при этом не меняется: если менять его, между обновлением Vercel и
+    // setWebhook возникает окно, в котором сообщения живых клиентов молча отбрасываются.
+    // Пустой ALT не должен пускать никого, поэтому сравниваем только при непустом значении.
+    const okSecret = provided === WEBHOOK_SECRET ||
+      (WEBHOOK_SECRET_ALT && provided === WEBHOOK_SECRET_ALT)
+    if (!okSecret) {
       console.warn('webhook: invalid secret_token header')
       return res.status(200).send('OK')
     }
