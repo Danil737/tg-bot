@@ -81,6 +81,51 @@ async function crmIngest(payload) {
   }
 }
 
+// Поиск захоронения делает CRM: там уже есть разбор выдачи, кэш на 14 дней и пауза
+// между запросами к чужому сайту. Дублировать это в боте значило бы завести второй
+// источник правды и вдвое чаще стучаться к epoisk.ru.
+async function crmGrave(payload) {
+  if (!CRM_URL || !CRM_SECRET) return null
+  try {
+    const ctrl = new AbortController()
+    const kill = setTimeout(() => ctrl.abort(), 12000)   // запрос уходит на внешний сайт
+    const r = await fetch(CRM_URL.replace(/\/+$/, '') + '/api/bot/grave', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CRM-Secret': CRM_SECRET },
+      body: JSON.stringify(payload),
+      signal: ctrl.signal,
+    })
+    clearTimeout(kill)
+    if (!r.ok) return null
+    return await r.json()
+  } catch (e) {
+    safeLog('crm.grave.fail', { error: String((e && e.message) || e).slice(0, 120) })
+    return null
+  }
+}
+
+// Выписка из ОТКРЫТОГО реестра. Формулировки намеренно осторожные: назначить человеку
+// могилу автоматом нельзя, ошибка тут дороже пользы. Больше трёх совпадений не
+// показываем — дальше это уже разговор с оператором.
+function graveReply(g) {
+  if (!g || !g.ok || !g.results || !g.results.length) return null
+  const rows = g.results.map((r) => {
+    const links = []
+    if (r.map_url) links.push(`<a href="${r.map_url}">план участка</a>`)
+    if (r.lat) links.push(`<a href="https://yandex.ru/maps/?pt=${r.lon},${r.lat}&z=18&l=sat">на карте</a>`)
+    const ins = (r.inscription || []).slice(0, 4).map((x) => htmlEsc(x)).join('\n     ')
+    return `📍 <b>${htmlEsc(r.uchastok)}</b> — ${htmlEsc(r.cemetery)}` +
+      (ins ? `\n     ${ins}` : '') +
+      (links.length ? `\n     ${links.join(' · ')}` : '')
+  })
+  const more = g.total > g.results.length
+    ? `\n\nВсего совпадений: ${g.total}, показаны первые ${g.results.length}.`
+    : ''
+  return `🔎 <b>Нашлось в открытом реестре захоронений</b>\n\n${rows.join('\n\n')}${more}\n\n` +
+    '<i>Это совпадение по ФИО из открытого реестра, а не подтверждение. ' +
+    'Точное место проверим при выезде и пришлём фото.</i>'
+}
+
 function crmProject(bot) {
   return bot === 'kmh' ? 'kissmyhands' : 'uhod-mogil'
 }
@@ -319,6 +364,23 @@ module.exports = async (req, res) => {
   const from = message.from || {}
   const name = [from.first_name, from.last_name].filter(Boolean).join(' ')
 
+  // === OWNER: /crm ===
+  // Ссылка на пульт под рукой, чтобы не искать её в переписке. Заодно короткая
+  // памятка — что именно в CRM делать, если открыл её с телефона на кладбище.
+  if (ALL_OWNER_IDS.has(chatId) && /^\/crm/i.test(text)) {
+    await sendMessage(chatId,
+      '🗂 <b>CRM — заявки, переписка, работы</b>\n\n' +
+      `${CRM_URL || 'https://crm.85-198-102-246.sslip.io'}\n\n` +
+      '• <b>Инбокс</b> — кто написал и кто ждёт ответа\n' +
+      '• <b>Календарь</b> — что делать сегодня и что просрочено\n' +
+      '• <b>Доска</b> — заказы по статусам\n' +
+      '• <b>Люди</b> — добавить мастера и выдать ему проекты\n\n' +
+      'Вся переписка из бота и с сайта попадает туда сама. Отвечать можно и оттуда, ' +
+      'и здесь ответом на уведомление — в карточке будет и то, и другое.',
+      {}, incomingBotToken)
+    return res.status(200).send('OK')
+  }
+
   // === OWNER REPLY ===
   // Either Daniil OR Сергей (any of ALL_OWNER_IDS) replying counts.
   if (ALL_OWNER_IDS.has(chatId) && message.reply_to_message) {
@@ -386,6 +448,17 @@ module.exports = async (req, res) => {
             },
           )
 
+          await crmIngest({
+            project_id: crmProject(sessionSite === 'kmh' ? 'kmh' : 'uhod'),
+            web_session: session.id,
+            direction: 'out',
+            text: caption || '',
+            media_kind: 'photo',
+            media_ref: largestPhoto.file_id,
+            author_label: replierChatId === OWNER_CHAT_ID ? 'Менеджер УходМогил' : 'Сергей',
+            landing: session.source_url || null,
+            source: 'чат на сайте',
+          })
           // Подтверждение — реакцией на само сообщение владельца (и для альбома тоже:
           // иначе каждое фото из альбома отвечало отдельной строкой)
           await reactOk(replierChatId, message.message_id, sessionBotToken)
@@ -405,6 +478,17 @@ module.exports = async (req, res) => {
           'POST',
           { session_id: session.id, role: 'admin', content: text, tg_message_id: replyToId },
         )
+        // И в CRM: разговор с сайта до сих пор жил только в Supabase, поэтому в карточке
+        // была видна половина истории клиента — телеграм есть, чат с сайта нет.
+        await crmIngest({
+          project_id: crmProject(sessionSite === 'kmh' ? 'kmh' : 'uhod'),
+          web_session: session.id,
+          direction: 'out',
+          text: text || '',
+          author_label: replierChatId === OWNER_CHAT_ID ? 'Менеджер УходМогил' : 'Сергей',
+          landing: session.source_url || null,
+          source: 'чат на сайте',
+        })
         await reactOk(replierChatId, message.message_id, sessionBotToken)
         // Broadcast to the OTHER owner so both Daniil and Sergey see the conversation.
         const replierLabel = replierChatId === OWNER_CHAT_ID ? 'Daniil' : 'Сергей'
@@ -508,10 +592,61 @@ module.exports = async (req, res) => {
         '✅ Выезд 1–3 дня\n' +
         '✅ Цены от 3 000 ₽\n\n' +
         'Напишите нам — на каком кладбище нужна уборка и что сделать. Ответим быстро!\n\n' +
+        '🔎 <b>Не знаете, где похоронен близкий?</b> Отправьте команду\n' +
+        '<code>/mogila Фамилия Имя Отчество, кладбище</code>\n' +
+        'и мы поищем участок в открытом реестре захоронений Москвы.\n\n' +
         '🌐 Сайт: https://uhod-mogil.ru\n' +
         '📢 Наш канал с фотоотчётами и календарём поминальных дней: <a href="https://t.me/uhod_mogil">t.me/uhod_mogil</a>',
         {}, incomingBotToken,
       )
+      // Карточку заводим уже на /start. Человек, открывший бота и замолчавший, — это
+      // всё равно лид: раньше он не оставлял следа нигде, и вспомнить о нём было нечем.
+      await crmIngest({
+        project_id: crmProject(incomingBot),
+        tg_chat_id: chatId,
+        tg_username: from.username || null,
+        name: name || null,
+        text: 'Открыл бота (/start)',
+        tg_msg_id: message.message_id,
+        source: 'telegram',
+      })
+      return res.status(200).send('OK')
+    }
+
+    // Явный поиск захоронения: /mogila Фамилия Имя Отчество, кладбище
+    if (/^\/mogila|^\/grave/i.test(text)) {
+      const q = text.replace(/^\/\w+(@\w+)?\s*/i, '').trim()
+      if (q.length < 5) {
+        await sendMessage(chatId,
+          'Напишите так:\n<code>/mogila Иванов Иван Иванович, Троекуровское</code>\n\n' +
+          'Кладбище можно не указывать — тогда поищем по всем московским.',
+          {}, incomingBotToken)
+        return res.status(200).send('OK')
+      }
+      const g = await crmGrave({
+        project_id: crmProject(incomingBot),
+        tg_chat_id: chatId,
+        tg_username: from.username || null,
+        name: name || null,
+        text: q,
+      })
+      const reply = graveReply(g)
+      await sendMessage(chatId,
+        reply ||
+        (g && g.need === 'fio'
+          ? 'Не разобрал имя. Нужны хотя бы фамилия и имя: <code>/mogila Иванов Иван, Хованское</code>'
+          : 'По этому запросу в открытом реестре ничего не нашлось. ' +
+            'Попробуйте без отчества или без названия кладбища — а лучше напишите нам, поищем вместе.'),
+        {}, incomingBotToken)
+      // Владелец должен видеть запрос: это горячий лид, человек ищет конкретную могилу.
+      await sendMessage(OWNER_CHAT_ID,
+        `🔎 <b>Клиент искал захоронение — ${incomingBot === 'kmh' ? 'KMH' : 'УходМогил'}</b>\n\n` +
+        `👤 ${htmlEsc(name)}${from.username ? ' · @' + htmlEsc(from.username) : ''}\n` +
+        `Запрос: ${htmlEsc(q)}\n` +
+        `Результат: ${g && g.total ? g.total + ' совпадений' : 'ничего не нашлось'}\n\n` +
+        `chatid: ${chatId}\n\n` +
+        '↩️ <i>Ответьте на это сообщение, чтобы написать клиенту</i>',
+        {}, incomingBotToken)
       return res.status(200).send('OK')
     }
 
@@ -557,7 +692,13 @@ module.exports = async (req, res) => {
         tg_chat_id: chatId,
         tg_username: from.username || null,
         name: name || null,
-        text: caption || '',
+        // Клиент нажал «поделиться контактом» — номер должен оказаться в карточке,
+        // а не только в тексте уведомления. Без этого оператор ищет телефон глазами
+        // по переписке, а звонить надо сейчас.
+        contact: message.contact ? (message.contact.phone_number || null) : null,
+        text: caption || (message.contact
+          ? `Прислал контакт: ${message.contact.phone_number || ''}`.trim()
+          : ''),
         media_kind: att.label || 'attachment',
         media_ref: att.fileId || null,
         tg_msg_id: message.message_id,
@@ -587,6 +728,30 @@ module.exports = async (req, res) => {
       tg_msg_id: message.message_id,
       source: 'telegram',
     })
+
+    // Догадка: в обычном сообщении есть и название кладбища, и ФИО («уборка на
+    // Троекуровском, дед Колычев Анатолий Иванович»). Тогда сразу показываем участок —
+    // это ровно тот момент, когда человеку нужен ответ.
+    // quiet: не нашли или не разобрали — молчим. Непрошеное «ничего не нашлось» в ответ
+    // на обычный вопрос выглядит как поломка, а в карточке остаётся мусором.
+    if (incomingBot !== 'kmh' && text && text.length >= 12) {
+      const g = await crmGrave({
+        project_id: crmProject(incomingBot),
+        tg_chat_id: chatId,
+        tg_username: from.username || null,
+        name: name || null,
+        text,
+        quiet: true,
+      })
+      const reply = graveReply(g)
+      if (reply) {
+        await sendMessage(chatId, reply, {}, incomingBotToken)
+        await sendMessage(OWNER_CHAT_ID,
+          `🔎 <i>Бот сам нашёл захоронение по сообщению клиента (${g.total} совпадений) ` +
+          `и показал его. chatid: ${chatId}</i>`,
+          {}, incomingBotToken)
+      }
+    }
   }
 
   res.status(200).send('OK')
