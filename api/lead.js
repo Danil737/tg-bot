@@ -150,6 +150,38 @@ async function saveLeadToCrm({ name, contact, service, cemetery, message, source
   }
 }
 
+// Заявка уходит ВТОРЫМ адресом — в CRM на РФ-сервере. Пока пишем в оба места:
+// старую панель /uhod в боте никто не отключал, и обрывать её на середине переезда
+// значит на день остаться без единого списка заявок. Supabase отключим, когда CRM
+// проработает без нареканий.
+//
+// Та же осторожность, что и с Supabase: любая ошибка только логируется. Заявка к этому
+// моменту уже доставлена в Telegram, и терять её из-за недоступной базы нельзя.
+const CRM_URL = process.env.CRM_URL || ''
+const CRM_SECRET = process.env.CRM_SECRET || ''
+
+async function saveLeadToRuCrm({ name, contact, service, cemetery, message, source }) {
+  if (!CRM_URL || !CRM_SECRET) return
+  try {
+    const r = await fetchWithTimeout(`${CRM_URL.replace(/\/+$/, '')}/api/lead`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CRM-Secret': CRM_SECRET },
+      body: JSON.stringify({
+        project_id: 'uhod-mogil',
+        name: name || null,
+        contact: contact || null,
+        service: service || null,
+        cemetery: cemetery || null,
+        message: message || null,
+        source: source || 'uhod-mogil.ru/zayavka',
+      }),
+    }, 5000)
+    if (!r.ok) console.error(`[ru-crm] lead ${r.status}: ${(await r.text()).slice(0, 160)}`)
+  } catch (e) {
+    console.error('[ru-crm] lead failed:', e && e.message)
+  }
+}
+
 module.exports = async (req, res) => {
   setCors(req, res)
   if (req.method === 'OPTIONS') return res.status(204).end()
@@ -227,6 +259,7 @@ module.exports = async (req, res) => {
     // Отзывы в CRM не кладём — это не заявка на работу.
     if (type === 'lead') {
       await saveLeadToCrm({ name, contact, service, cemetery, message, source, body, req })
+      await saveLeadToRuCrm({ name, contact, service, cemetery, message, source })
     }
 
     return res.status(200).json({ ok: true })
