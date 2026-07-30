@@ -39,6 +39,28 @@ function siteLabel(site) {
   return site === 'kissmyhands' ? 'Kiss My Hands' : 'УходМогил'
 }
 
+// Зеркало разговора в CRM. Раньше чат с сайта жил только в Supabase, и в карточке
+// клиента было видно ровно половину его истории: телеграм есть, чат с сайта нет —
+// а это тот самый разговор, где человек называет кладбище и имя покойного.
+//
+// Ключ склейки — id сессии: chat_id тут неоткуда взять. CRM не должна ломать чат:
+// короткий таймаут, ошибки только в лог.
+const CRM_URL = process.env.CRM_URL || ''
+const CRM_SECRET = process.env.CRM_SECRET || ''
+
+async function crmMirror(payload) {
+  if (!CRM_URL || !CRM_SECRET) return
+  try {
+    await fetchWithTimeout(`${CRM_URL.replace(/\/+$/, '')}/api/ingest`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CRM-Secret': CRM_SECRET },
+      body: JSON.stringify(payload),
+    }, 3500)
+  } catch (e) {
+    safeLog('crm.mirror.fail', { error: String((e && e.message) || e).slice(0, 120) })
+  }
+}
+
 // Triggers escalation. Tolerant to flection ("передам/передаю менеджеру/специалисту")
 // and the leading checkmark fallback.
 const ESCALATION_RE = /перед[аеи][юм][^.!?]{0,40}менеджер|^✓/i
@@ -360,6 +382,13 @@ module.exports = async (req, res) => {
 
     // Save user message
     await saveMessage(session.id, 'user', message.trim())
+    await crmMirror({
+      project_id: site === 'kissmyhands' ? 'kissmyhands' : 'uhod-mogil',
+      web_session: session.id,
+      text: message.trim(),
+      landing: session.source_url || sourceUrl || null,
+      source: 'чат на сайте',
+    })
 
     // KissMyHands: no AI — every chat goes straight to owner (Сергей отвечает лично).
     // Force escalation on first message; subsequent messages just forward as in escalated mode.
@@ -424,6 +453,15 @@ module.exports = async (req, res) => {
     }
 
     await saveMessage(session.id, 'ai', aiText)
+    await crmMirror({
+      project_id: site === 'kissmyhands' ? 'kissmyhands' : 'uhod-mogil',
+      web_session: session.id,
+      direction: 'out',
+      text: aiText,
+      author_label: 'Автоответчик сайта',
+      landing: session.source_url || sourceUrl || null,
+      source: 'чат на сайте',
+    })
 
     if (ESCALATION_RE.test(aiText)) {
       escalate = true
