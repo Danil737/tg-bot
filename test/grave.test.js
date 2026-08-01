@@ -2,6 +2,7 @@
 // Запуск: node test/grave.test.js
 const {
   graveOwnerText, graveClientText, graveKeyboard, graveClientLabel, graveShown, htmlToPlain,
+  looksLikeGraveText,
 } = require('../api/_lib')
 
 const BEST = {
@@ -47,6 +48,20 @@ const VAGUE = {
 let fails = 0
 function check(name, cond, extra) {
   if (cond) { console.log('ok   ' + name) } else { fails++; console.log('FAIL ' + name, extra || '') }
+}
+
+// По чему вообще полезем в реестр, когда владелец пишет свободный текст.
+for (const [t, want] of [
+  ['Троекуровское, Иванов Иван Иванович 1937', true],
+  ['Домодедовское кладбище, участок 23, Морозов Дмитрий', true],
+  ['на Хованском лежит бабушка, Петрова Анна', true],
+  ['Привет, что по заказу Еловой?', false],
+  ['Завтра выезд в 10, оплату получил', false],
+  ['Московский район, приеду завтра', false],
+  ['кладбище', false],
+]) {
+  check('триггер: ' + (want ? 'ищем' : 'молчим') + ' — ' + t.slice(0, 32),
+    looksLikeGraveText(t) === want)
 }
 
 const sure = graveOwnerText(SURE, 'по вашему сообщению')

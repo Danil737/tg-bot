@@ -2,6 +2,7 @@ const {
   fetchWithTimeout, safeLog,
   crmGraveSearch, crmGravePick, crmClients,
   htmlToPlain, graveOwnerText, graveClientText, graveKeyboard, graveClientLabel, graveShown,
+  looksLikeGraveText,
 } = require('./_lib')
 
 const OWNER_CHAT_ID = parseInt(process.env.OWNER_CHAT_ID || '696698928', 10)
@@ -715,7 +716,7 @@ module.exports = async (req, res) => {
   // 01.08.2026 такое сообщение (участок 23, две ФИО, Домодедовское) осталось без ответа
   // именно потому, что поиск стоял только на клиентской ветке.
   if (ALL_OWNER_IDS.has(chatId) && incomingBot !== 'kmh' && text && !text.startsWith('/') &&
-      text.length >= 12 && /кладбищ|могил|участок|захорон|похорон/i.test(text)) {
+      looksLikeGraveText(text)) {
     const g = await crmGraveSearch({ project_id: crmProject(incomingBot), text })
     await sendGraveToOwner(chatId, g, incomingBotToken, null, 'по вашему сообщению', null, true)
     return res.status(200).send('OK')

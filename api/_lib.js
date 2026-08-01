@@ -318,6 +318,17 @@ function graveKeyboard(results, clientId) {
   return rows.length ? { reply_markup: { inline_keyboard: rows } } : {}
 }
 
+// Стоит ли вообще идти в реестр по СВОБОДНОМУ тексту владельца. Название кладбища —
+// сигнал не хуже слова «кладбище»: люди пишут «Троекуровское, Иванов Иван Иванович».
+// Конец слова ловим отрицательным просмотром, а не \b: для \b кириллица не буква,
+// и «Троекуровское,» границей не считалось — условие молчало на самом частом случае.
+function looksLikeGraveText(text) {
+  const t = String(text || '')
+  if (t.length < 12) return false
+  return /кладбищ|могил|участок|захорон|похорон/i.test(t) ||
+    /[А-ЯЁ][а-яё-]+ск(?:ое|ом|ого|ому|им)(?![а-яё])/.test(t)
+}
+
 // Карточки из веб-чата заводятся без имени — по одному id их не различить,
 // поэтому в подписи кнопки идёт последняя фраза клиента.
 function graveClientLabel(c) {
@@ -334,4 +345,5 @@ module.exports = {
   crmPost, crmGraveSearch, crmGravePick, crmClients,
   htmlEscape, htmlToPlain,
   graveOwnerText, graveClientText, graveKeyboard, graveClientLabel, graveShown,
+  looksLikeGraveText,
 }
