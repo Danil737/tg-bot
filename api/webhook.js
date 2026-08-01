@@ -409,12 +409,14 @@ async function handleGraveCallback(cq, incomingBot, botToken) {
       const sent = await sendMessage(client.tg_chat_id, body, { disable_web_page_preview: true }, botToken)
       ok = !!sent.ok
     } else if (client.web_session) {
+      // return=representation обязателен: на обычной вставке Supabase отвечает пустым
+      // телом, sb() отдаёт null — и успешная отправка была бы прочитана как отказ.
       const w = await sb('web_chat_messages', 'POST', {
         session_id: client.web_session,
         role: 'admin',
         content: htmlToPlain(body),
-      })
-      ok = w !== null
+      }, 'return=representation')
+      ok = Array.isArray(w) ? w.length > 0 : w !== null
     }
     if (!ok) {
       await answerCallback(cq.id, 'Отправить не удалось — открой карточку в CRM', botToken, true)
