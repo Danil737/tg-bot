@@ -238,34 +238,68 @@ function htmlToPlain(s) {
     .replace(/&amp;/g, '&')
 }
 
+// «ЗИ/037/23/0996» — это код реестра, а спрашивают всегда про участок и могилу.
+// Показываем словами, код оставляем мелким: по нему потом ищут в конторе кладбища.
+function uchastokLabel(u) {
+  const p = String(u || '').split('/')
+  return p.length >= 4 ? `участок ${p[2]}, могила ${p[3]}` : String(u || '')
+}
+
+// В выдаче попадаются строки вроде «Данные не читаются» — в ответе они занимают место
+// и ничего не говорят. Оставляем то, что похоже на имя человека.
+function graveNames(r) {
+  return (r.inscription || []).filter((s) => /[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+/.test(s))
+}
+
+function graveRow(r, full) {
+  const names = graveNames(r).slice(0, full ? 4 : 2).map((x) => `   ${htmlEscape(x)}`)
+  const links = []
+  if (r.map_url) links.push(`<a href="${r.map_url}">план участка</a>`)
+  if (r.lat) links.push(`<a href="https://yandex.ru/maps/?pt=${r.lon},${r.lat}&z=18&l=sat">карта</a>`)
+  return `📍 <b>${htmlEscape(uchastokLabel(r.uchastok))}</b>  <code>${htmlEscape(r.uchastok)}</code>` +
+    (names.length ? `\n${names.join('\n')}` : '') +
+    ((r.why || []).length ? `\n   ✅ ${htmlEscape(r.why.join(' · '))}` : '') +
+    (links.length ? `\n   ${links.join(' · ')}` : '')
+}
+
 // Выписка ДЛЯ ВЛАДЕЛЬЦА. Клиенту сама не уходит: совпадение по ФИО — ещё не та могила,
 // а цена ошибки несоизмерима с экономией одного сообщения. Отправляет человек кнопкой.
+//
+// Однофамильцы в выдаче есть почти всегда, и три полные карточки подряд — это стена
+// текста, в которой не видно ответа. Если одна строка сошлась с текстом клиента
+// (номер участка, второе имя в той же могиле) — показываем её одну.
+// Что реально показываем. Кнопок должно быть ровно столько же: иначе под ответом
+// с одним участком висят три кнопки и непонятно, что уйдёт клиенту.
+function graveShown(g) {
+  if (!g || !g.ok || !g.results || !g.results.length) return []
+  const rs = g.results
+  const best = rs[0]
+  const decisive = (best.score || 0) >= 3 && (rs.length < 2 || (best.score || 0) > (rs[1].score || 0))
+  return decisive ? [best] : rs
+}
+
 function graveOwnerText(g, origin = 'по сообщению клиента') {
-  if (!g || !g.ok || !g.results || !g.results.length) return null
-  const rows = g.results.map((r) => {
-    const links = []
-    if (r.map_url) links.push(`<a href="${r.map_url}">план участка</a>`)
-    if (r.lat) links.push(`<a href="https://yandex.ru/maps/?pt=${r.lon},${r.lat}&z=18&l=sat">на карте</a>`)
-    const ins = (r.inscription || []).slice(0, 4).map((x) => htmlEscape(x)).join('\n     ')
-    return `📍 <b>${htmlEscape(r.uchastok)}</b> — ${htmlEscape(r.cemetery)}` +
-      (ins ? `\n     ${ins}` : '') +
-      (links.length ? `\n     ${links.join(' · ')}` : '')
-  })
-  const more = g.total > g.results.length
-    ? `\n\nВсего совпадений: ${g.total}, показаны первые ${g.results.length}.`
-    : ''
-  return `🔎 <b>Реестр захоронений — ${htmlEscape(origin)}</b>\n\n${rows.join('\n\n')}${more}`
+  const shown = graveShown(g)
+  if (!shown.length) return null
+  const head = `🔎 <b>${htmlEscape(g.cemetery || 'Реестр захоронений')}</b> · <i>${htmlEscape(origin)}</i>`
+  if (shown.length === 1 && g.results.length > 1) {
+    const rest = (g.total || 1) - 1
+    return `${head}\n\n${graveRow(shown[0], true)}` +
+      `\n\n<i>Ещё ${rest} по фамилии — по участку и второму имени не сходятся.</i>`
+  }
+  const more = g.total > shown.length ? `\n\n<i>Всего ${g.total}, показаны ${shown.length}.</i>` : ''
+  return `${head}\n\n${shown.map((r) => graveRow(r, shown.length === 1)).join('\n\n')}${more}`
 }
 
 // Текст, который уходит КЛИЕНТУ по кнопке. Формулировка намеренно вопросительная:
 // подтвердить участок может только тот, кто знает свою могилу.
 function graveClientText(r) {
-  const ins = (r.inscription || []).slice(0, 6).map((x) => `• ${htmlEscape(x)}`).join('\n')
+  const ins = graveNames(r).slice(0, 6).map((x) => `• ${htmlEscape(x)}`).join('\n')
   const links = []
   if (r.map_url) links.push(`<a href="${r.map_url}">план участка</a>`)
   if (r.lat) links.push(`<a href="https://yandex.ru/maps/?pt=${r.lon},${r.lat}&z=18&l=sat">точка на карте</a>`)
-  return '🕯 Нашли совпадение в открытом реестре захоронений:\n\n' +
-    `📍 <b>Участок ${htmlEscape(r.uchastok)}</b> — ${htmlEscape(r.cemetery)}\n` +
+  return '🕯 Нашли в открытом реестре захоронений:\n\n' +
+    `📍 <b>${htmlEscape(r.cemetery)} кладбище, ${htmlEscape(uchastokLabel(r.uchastok))}</b>\n` +
     (ins ? `\nНадпись на памятнике:\n${ins}\n` : '') +
     (links.length ? `\n${links.join(' · ')}\n` : '') +
     '\nПодскажите, пожалуйста, это тот самый участок? Совпадение по фамилии и имени — ещё не ' +
@@ -276,7 +310,9 @@ function graveClientText(r) {
 // не известен (выписку поднял я сам своим сообщением) — сначала спросим кому.
 function graveKeyboard(results, clientId) {
   const rows = (results || []).filter((r) => r.gid).map((r) => [{
-    text: `📤 Отправить клиенту: ${r.uchastok}`.slice(0, 60),
+    text: ((results || []).length > 1
+      ? `📤 Клиенту: ${uchastokLabel(r.uchastok)}`
+      : '📤 Отправить клиенту').slice(0, 60),
     callback_data: clientId ? `gs:${r.gid}:${clientId}` : `gc:${r.gid}`,
   }])
   return rows.length ? { reply_markup: { inline_keyboard: rows } } : {}
@@ -297,5 +333,5 @@ module.exports = {
   classifyAttribution, attributionLineMd,
   crmPost, crmGraveSearch, crmGravePick, crmClients,
   htmlEscape, htmlToPlain,
-  graveOwnerText, graveClientText, graveKeyboard, graveClientLabel,
+  graveOwnerText, graveClientText, graveKeyboard, graveClientLabel, graveShown,
 }

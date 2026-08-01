@@ -1,7 +1,7 @@
 const {
   fetchWithTimeout, safeLog,
   crmGraveSearch, crmGravePick, crmClients,
-  htmlToPlain, graveOwnerText, graveClientText, graveKeyboard, graveClientLabel,
+  htmlToPlain, graveOwnerText, graveClientText, graveKeyboard, graveClientLabel, graveShown,
 } = require('./_lib')
 
 const OWNER_CHAT_ID = parseInt(process.env.OWNER_CHAT_ID || '696698928', 10)
@@ -354,8 +354,8 @@ async function sendGraveToOwner(toChatId, g, botToken, clientId, origin, custome
     (g.cemetery ? '' : '\n\n⚠️ Кладбище не названо — это совпадения по всей Москве.') +
     (customerChatId ? `\n\nchatid: ${customerChatId}` : '') +
     cardLink +
-    '\n\n↩️ <i>Клиенту НЕ отправлено. Кнопка ниже отправит выписку и спросит, тот ли это участок.</i>',
-    { disable_web_page_preview: true, ...graveKeyboard(g.results, clientId) },
+    '\n\n↩️ <i>Клиенту не отправлено — кнопка ниже.</i>',
+    { disable_web_page_preview: true, ...graveKeyboard(graveShown(g), clientId) },
     botToken)
 }
 

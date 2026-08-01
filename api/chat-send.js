@@ -11,7 +11,7 @@
 
 const {
   isValidUuid, fetchWithTimeout, safeLog, getClientMeta, clientMetaBlockMd, attributionLineMd,
-  crmGraveSearch, graveOwnerText, graveKeyboard,
+  crmGraveSearch, graveOwnerText, graveKeyboard, graveShown,
 } = require('./_lib')
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fxxmhnmvttvfatdlxpxk.supabase.co'
@@ -314,8 +314,7 @@ async function graveLookupForOwner(session, message, site) {
     if (!token) return
     const body = found +
       (g.cemetery ? '' : '\n\n⚠️ Кладбище не названо — это совпадения по всей Москве.') +
-      `\n\nСессия ${session.id.slice(0, 8)}` +
-      '\n\n↩️ <i>Клиенту НЕ отправлено. Кнопка ниже отправит выписку и спросит, тот ли это участок.</i>'
+      `\n\n↩️ <i>Чат сайта ${session.id.slice(0, 8)} · клиенту не отправлено — кнопка ниже.</i>`
     await fetchWithTimeout(
       `https://api.telegram.org/bot${token}/sendMessage`,
       {
@@ -326,7 +325,7 @@ async function graveLookupForOwner(session, message, site) {
           text: body,
           parse_mode: 'HTML',
           disable_web_page_preview: true,
-          ...graveKeyboard(g.results, g.client_id),
+          ...graveKeyboard(graveShown(g), g.client_id),
         }),
       },
       8000,
