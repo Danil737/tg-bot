@@ -9,7 +9,10 @@
 //   4. Save user message → Groq (with retry+jitter+timeout) → save AI reply
 //   5. If AI says escalation marker → notify owner in TG, mark session escalated
 
-const { isValidUuid, fetchWithTimeout, safeLog, getClientMeta, clientMetaBlockMd, attributionLineMd } = require('./_lib')
+const {
+  isValidUuid, fetchWithTimeout, safeLog, getClientMeta, clientMetaBlockMd, attributionLineMd,
+  crmGraveSearch, graveOwnerText, graveKeyboard,
+} = require('./_lib')
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fxxmhnmvttvfatdlxpxk.supabase.co'
 const SUPABASE_SECRET = process.env.SUPABASE_SECRET_KEY
@@ -288,6 +291,51 @@ function encodeExtraOwners(extraMsgIds) {
   return 'extra:' + extraMsgIds.map(e => `${e.chat_id}:${e.message_id}`).join(';')
 }
 
+
+// Клиент пишет данные покойного в чат на сайте — выписка из реестра нужна мне сразу,
+// а не после того, как я открою CRM. До 01.08.2026 поиск стоял только на телеграм-ветке,
+// и веб-чат (а именно оттуда приходит большая часть) оставался без него.
+// quiet: не разобрали или не нашли — молчим совсем, в том числе в карточке.
+async function graveLookupForOwner(session, message, site) {
+  if (site === 'kissmyhands') return
+  if (!message || message.trim().length < 12) return
+  try {
+    const g = await crmGraveSearch({
+      project_id: 'uhod-mogil',
+      web_session: session.id,
+      source: 'чат на сайте',
+      landing: session.source_url || null,
+      text: message,
+      quiet: true,
+    })
+    const found = graveOwnerText(g)
+    if (!found) return
+    const token = botTokenForSite(site)
+    if (!token) return
+    const body = found +
+      (g.cemetery ? '' : '\n\n⚠️ Кладбище не названо — это совпадения по всей Москве.') +
+      `\n\nСессия ${session.id.slice(0, 8)}` +
+      '\n\n↩️ <i>Клиенту НЕ отправлено. Кнопка ниже отправит выписку и спросит, тот ли это участок.</i>'
+    await fetchWithTimeout(
+      `https://api.telegram.org/bot${token}/sendMessage`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: OWNER_CHAT_ID,
+          text: body,
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+          ...graveKeyboard(g.results, g.client_id),
+        }),
+      },
+      8000,
+    )
+  } catch (e) {
+    safeLog('grave.web.fail', { error: String((e && e.message) || e).slice(0, 120) })
+  }
+}
+
 async function notifyOwnerEscalation(session, history, site = 'uhod-mogil', meta = null, attribution = null) {
   const dialogue = history
     .map((m) => {
@@ -389,6 +437,10 @@ module.exports = async (req, res) => {
       landing: session.source_url || sourceUrl || null,
       source: 'чат на сайте',
     })
+
+    // Данные покойного приходят и в ПЕРВОМ сообщении, до всякой эскалации — поэтому
+    // поиск стоит здесь, а не в ветке «чат уже передан менеджеру».
+    await graveLookupForOwner(session, message.trim(), site)
 
     // KissMyHands: no AI — every chat goes straight to owner (Сергей отвечает лично).
     // Force escalation on first message; subsequent messages just forward as in escalated mode.

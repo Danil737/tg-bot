@@ -1,4 +1,8 @@
-const { fetchWithTimeout, safeLog } = require('./_lib')
+const {
+  fetchWithTimeout, safeLog,
+  crmGraveSearch, crmGravePick, crmClients,
+  htmlToPlain, graveOwnerText, graveClientText, graveKeyboard, graveClientLabel,
+} = require('./_lib')
 
 const OWNER_CHAT_ID = parseInt(process.env.OWNER_CHAT_ID || '696698928', 10)
 const KMH_EXTRA_OWNER_IDS = (process.env.KMH_EXTRA_OWNER_IDS || '1650405909')
@@ -81,49 +85,8 @@ async function crmIngest(payload) {
   }
 }
 
-// Поиск захоронения делает CRM: там уже есть разбор выдачи, кэш на 14 дней и пауза
-// между запросами к чужому сайту. Дублировать это в боте значило бы завести второй
-// источник правды и вдвое чаще стучаться к epoisk.ru.
-async function crmGrave(payload) {
-  if (!CRM_URL || !CRM_SECRET) return null
-  try {
-    const ctrl = new AbortController()
-    const kill = setTimeout(() => ctrl.abort(), 12000)   // запрос уходит на внешний сайт
-    const r = await fetch(CRM_URL.replace(/\/+$/, '') + '/api/bot/grave', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-CRM-Secret': CRM_SECRET },
-      body: JSON.stringify(payload),
-      signal: ctrl.signal,
-    })
-    clearTimeout(kill)
-    if (!r.ok) return null
-    return await r.json()
-  } catch (e) {
-    safeLog('crm.grave.fail', { error: String((e && e.message) || e).slice(0, 120) })
-    return null
-  }
-}
-
-// Выписка из ОТКРЫТОГО реестра — ДЛЯ ВЛАДЕЛЬЦА, не для клиента.
-// Автомат не должен объявлять человеку, где лежит его дед: совпадение по ФИО это ещё
-// не та могила, а цена ошибки тут несоизмерима с экономией одного сообщения. Владелец
-// смотрит выписку, при необходимости уточняет год рождения или участок — и отвечает сам.
-function graveReply(g) {
-  if (!g || !g.ok || !g.results || !g.results.length) return null
-  const rows = g.results.map((r) => {
-    const links = []
-    if (r.map_url) links.push(`<a href="${r.map_url}">план участка</a>`)
-    if (r.lat) links.push(`<a href="https://yandex.ru/maps/?pt=${r.lon},${r.lat}&z=18&l=sat">на карте</a>`)
-    const ins = (r.inscription || []).slice(0, 4).map((x) => htmlEsc(x)).join('\n     ')
-    return `📍 <b>${htmlEsc(r.uchastok)}</b> — ${htmlEsc(r.cemetery)}` +
-      (ins ? `\n     ${ins}` : '') +
-      (links.length ? `\n     ${links.join(' · ')}` : '')
-  })
-  const more = g.total > g.results.length
-    ? `\n\nВсего совпадений: ${g.total}, показаны первые ${g.results.length}.`
-    : ''
-  return `🔎 <b>Реестр захоронений — по сообщению клиента</b>\n\n${rows.join('\n\n')}${more}`
-}
+// Поиск захоронения и разбор выдачи — в api/_lib.js (crmGraveSearch/graveOwnerText):
+// тот же код нужен и вебхуку, и чату на сайте.
 
 function crmProject(bot) {
   return bot === 'kmh' ? 'kissmyhands' : 'uhod-mogil'
@@ -324,6 +287,155 @@ async function downloadAndStorePhoto(fileId, sessionId, botToken = BOT_TOKEN) {
   }
 }
 
+
+async function answerCallback(callbackId, text, botToken = BOT_TOKEN, alert = false) {
+  try {
+    await fetchWithTimeout(
+      `https://api.telegram.org/bot${botToken}/answerCallbackQuery`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ callback_query_id: callbackId, text: text || '', show_alert: !!alert }),
+      },
+      6000,
+    )
+  } catch (e) {
+    safeLog('answerCallbackQuery failed', { err: e.message })
+  }
+}
+
+async function editReplyMarkup(chatId, messageId, markup, botToken = BOT_TOKEN) {
+  try {
+    await fetchWithTimeout(
+      `https://api.telegram.org/bot${botToken}/editMessageReplyMarkup`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, message_id: messageId, reply_markup: markup }),
+      },
+      6000,
+    )
+  } catch (e) {
+    safeLog('editMessageReplyMarkup failed', { err: e.message })
+  }
+}
+
+// Выписка владельцу — из трёх мест: клиент написал в бота, клиент написал в чат на сайте,
+// я сам принёс текст (переслал из вацапа/MAX) или позвал /mogila. Формат один.
+async function sendGraveToOwner(toChatId, g, botToken, clientId, origin, customerChatId, quietIfNoFio) {
+  // ФИО в тексте не разобрано (или CRM молчит) — на моё СВОБОДНОЕ сообщение отвечать
+  // нечем и незачем: «кладбище» и «участок» я пишу в чат и по другим поводам, а лишний
+  // ответ на каждый из них быстро приучает не читать бота. Явный /mogila — другое дело.
+  if (!g || g.need === 'fio') {
+    if (quietIfNoFio) return
+    await sendMessage(toChatId,
+      !g
+        ? '⚠️ CRM не ответила — поиск по реестру сейчас недоступен.'
+        : '🔎 Нужны хотя бы фамилия и имя:\n<code>/mogila Фамилия Имя Отчество, кладбище</code>',
+      {}, botToken)
+    return
+  }
+  const found = graveOwnerText(g, origin)
+  if (!found) {
+    const who = g && g.fio ? ` по «${htmlEsc(g.fio)}»` : ''
+    await sendMessage(toChatId,
+      `🔎 В реестре захоронений ничего не нашлось${who}.\n\n` +
+      '<i>Реестр открытый и неполный: у части старых могил надпись в нём не заведена. ' +
+      'Уточнить можно в конторе кладбища или на выезде.</i>',
+      {}, botToken)
+    return
+  }
+  const cardLink = g.client_id && CRM_URL
+    ? `\n🗂 <a href="${CRM_URL.replace(/\/+$/, '')}/#c${g.client_id}">Карточка в CRM</a>` +
+      (g.photos ? ` — там же ${g.photos} фото от клиента, есть с чем сверить` : '')
+    : ''
+  await sendMessage(toChatId,
+    found +
+    (g.cemetery ? '' : '\n\n⚠️ Кладбище не названо — это совпадения по всей Москве.') +
+    (customerChatId ? `\n\nchatid: ${customerChatId}` : '') +
+    cardLink +
+    '\n\n↩️ <i>Клиенту НЕ отправлено. Кнопка ниже отправит выписку и спросит, тот ли это участок.</i>',
+    { disable_web_page_preview: true, ...graveKeyboard(g.results, clientId) },
+    botToken)
+}
+
+// Кнопки под выпиской. В callback_data влезает 64 байта, поэтому в них только gid
+// захоронения и id карточки — текст клиенту собирается заново в момент нажатия.
+async function handleGraveCallback(cq, incomingBot, botToken) {
+  const data = String(cq.data || '')
+  const chatId = cq.message?.chat?.id
+  const msgId = cq.message?.message_id
+  if (!ALL_OWNER_IDS.has(cq.from?.id)) {
+    await answerCallback(cq.id, 'Кнопка только для владельца', botToken, true)
+    return
+  }
+  if (data === 'noop') {
+    await answerCallback(cq.id, '', botToken)
+    return
+  }
+
+  // Шаг 1: выписку я поднял своим сообщением — бот не знает, о каком клиенте речь.
+  if (data.startsWith('gc:')) {
+    const gid = data.slice(3)
+    const clients = await crmClients(crmProject(incomingBot), { limit: 6 })
+    if (!clients.length) {
+      await answerCallback(cq.id, 'В CRM нет карточек — некому отправить', botToken, true)
+      return
+    }
+    const rows = clients.map((c) => [{
+      text: `👤 ${graveClientLabel(c)}`,
+      callback_data: `gs:${gid}:${c.id}`,
+    }])
+    rows.push([{ text: '⬅️ Не отправлять', callback_data: 'noop' }])
+    await editReplyMarkup(chatId, msgId, { inline_keyboard: rows }, botToken)
+    await answerCallback(cq.id, 'Кому отправить?', botToken)
+    return
+  }
+
+  // Шаг 2: отправка выписки клиенту тем же каналом, которым он пишет сам.
+  if (data.startsWith('gs:')) {
+    const [, gid, cid] = data.split(':')
+    const pick = await crmGravePick(gid)
+    const r = pick && pick.ok ? pick.result : null
+    const found = await crmClients(crmProject(incomingBot), { id: Number(cid) })
+    const client = found[0]
+    if (!r || !client) {
+      await answerCallback(cq.id, 'Не нашёл данные — открой карточку в CRM', botToken, true)
+      return
+    }
+    const body = graveClientText(r)
+    let ok = false
+    if (client.tg_chat_id) {
+      const sent = await sendMessage(client.tg_chat_id, body, { disable_web_page_preview: true }, botToken)
+      ok = !!sent.ok
+    } else if (client.web_session) {
+      const w = await sb('web_chat_messages', 'POST', {
+        session_id: client.web_session,
+        role: 'admin',
+        content: htmlToPlain(body),
+      })
+      ok = w !== null
+    }
+    if (!ok) {
+      await answerCallback(cq.id, 'Отправить не удалось — открой карточку в CRM', botToken, true)
+      return
+    }
+    await crmIngest({
+      project_id: client.project_id || crmProject(incomingBot),
+      tg_chat_id: client.tg_chat_id || undefined,
+      web_session: client.web_session || undefined,
+      direction: 'out',
+      text: htmlToPlain(body),
+      author_label: 'Выписка из реестра · отправлена клиенту',
+      source: client.web_session ? 'чат на сайте' : 'telegram',
+    })
+    await editReplyMarkup(chatId, msgId, {
+      inline_keyboard: [[{ text: `✅ Отправлено — ${graveClientLabel(client)}`, callback_data: 'noop' }]],
+    }, botToken)
+    await answerCallback(cq.id, '✅ Отправлено клиенту', botToken)
+  }
+}
+
 module.exports = async (req, res) => {
   if (req.method !== 'POST') return res.status(200).send('OK')
 
@@ -354,7 +466,12 @@ module.exports = async (req, res) => {
     return res.status(200).send('OK')
   }
 
-  const { message } = req.body || {}
+  // Нажатие кнопки под выпиской. allowed_updates вебхука callback_query уже включает.
+  const { message, callback_query: callbackQuery } = req.body || {}
+  if (callbackQuery) {
+    await handleGraveCallback(callbackQuery, incomingBot, incomingBotToken)
+    return res.status(200).send('OK')
+  }
   if (!message) return res.status(200).send('OK')
 
   const chatId = message.chat?.id
@@ -565,6 +682,43 @@ module.exports = async (req, res) => {
     return res.status(200).send('OK')
   }
 
+  // === OWNER: /mogila ===
+  // Явный поиск: «/mogila Морозов Дмитрий Иванович, Домодедовское».
+  if (ALL_OWNER_IDS.has(chatId) && /^\/mogila/i.test(text)) {
+    const q = text.replace(/^\/mogila(@\w+)?/i, '').trim()
+    if (!q) {
+      await sendMessage(chatId,
+        '🔎 <b>Поиск захоронения</b>\n\n' +
+        '<code>/mogila Фамилия Имя Отчество, кладбище</code>\n\n' +
+        'Кладбище можно не писать — тогда ищу по всей Москве и области. ' +
+        'Найденное отправляется клиенту кнопкой, вручную набирать ничего не нужно.',
+        {}, incomingBotToken)
+      return res.status(200).send('OK')
+    }
+    const parts = q.split(',').map((s) => s.trim()).filter(Boolean)
+    const payload = { project_id: crmProject(incomingBot) }
+    if (parts.length >= 2) {
+      payload.fio = parts[0]
+      payload.cemetery = parts[1]
+    } else {
+      payload.text = q
+    }
+    const g = await crmGraveSearch(payload)
+    await sendGraveToOwner(chatId, g, incomingBotToken, null, 'по запросу /mogila')
+    return res.status(200).send('OK')
+  }
+
+  // === OWNER: данные покойного, присланные мной ===
+  // Клиент часто пишет не в бота, а в вацап, MAX или звонит — я переношу его текст сюда.
+  // 01.08.2026 такое сообщение (участок 23, две ФИО, Домодедовское) осталось без ответа
+  // именно потому, что поиск стоял только на клиентской ветке.
+  if (ALL_OWNER_IDS.has(chatId) && incomingBot !== 'kmh' && text && !text.startsWith('/') &&
+      text.length >= 12 && /кладбищ|могил|участок|захорон|похорон/i.test(text)) {
+    const g = await crmGraveSearch({ project_id: crmProject(incomingBot), text })
+    await sendGraveToOwner(chatId, g, incomingBotToken, null, 'по вашему сообщению', null, true)
+    return res.status(200).send('OK')
+  }
+
   // === CUSTOMER MESSAGE in direct TG ===
   if (chatId !== OWNER_CHAT_ID) {
     if (text === '/start') {
@@ -696,7 +850,7 @@ module.exports = async (req, res) => {
     // памятника всё равно человеку. Ты решаешь, писать клиенту или сначала уточнить.
     // quiet: не разобрали или не нашли — молчим совсем, в том числе в карточке.
     if (incomingBot !== 'kmh' && text && text.length >= 12) {
-      const g = await crmGrave({
+      const g = await crmGraveSearch({
         project_id: crmProject(incomingBot),
         tg_chat_id: chatId,
         tg_username: from.username || null,
@@ -704,19 +858,9 @@ module.exports = async (req, res) => {
         text,
         quiet: true,
       })
-      const found = graveReply(g)
-      if (found) {
-        const cardLink = g.client_id && CRM_URL
-          ? `\n\n🗂 <a href="${CRM_URL.replace(/\/+$/, '')}/#c${g.client_id}">Карточка в CRM</a>` +
-            (g.photos ? ` — там же ${g.photos} фото от клиента, есть с чем сверить` : '')
-          : ''
-        await sendMessage(OWNER_CHAT_ID,
-          `${found}\n\n` +
-          (g.cemetery ? '' : '⚠️ Кладбище в сообщении не названо — это совпадения по всей Москве.\n') +
-          `chatid: ${chatId}${cardLink}\n\n` +
-          '↩️ <i>Клиенту это НЕ отправлено. Ответьте на это сообщение, если хотите переслать ' +
-          'или уточнить — уйдёт клиенту.</i>',
-          {}, incomingBotToken)
+      if (graveOwnerText(g)) {
+        await sendGraveToOwner(OWNER_CHAT_ID, g, incomingBotToken, g.client_id,
+          'по сообщению клиента', chatId)
       }
     }
   }

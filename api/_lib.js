@@ -178,8 +178,124 @@ function attributionLineMd(attr) {
   return out
 }
 
+
+// --- Реестр захоронений (epoisk.ru через CRM) --------------------------------
+// Сам поиск живёт в CRM: там кэш на 14 дней, пауза между запросами к чужому сайту и
+// разбор выдачи. Бот только спрашивает и показывает — второй копии парсера нет.
+const CRM_URL = process.env.CRM_URL || ''
+const CRM_SECRET = process.env.CRM_SECRET || ''
+
+async function crmPost(path, payload, timeoutMs = 6000) {
+  if (!CRM_URL || !CRM_SECRET) return null
+  try {
+    const r = await fetchWithTimeout(
+      CRM_URL.replace(/\/+$/, '') + path,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CRM-Secret': CRM_SECRET },
+        body: JSON.stringify(payload),
+      },
+      timeoutMs,
+    )
+    if (!r.ok) {
+      safeLog('crm.post.status', { path, status: r.status })
+      return null
+    }
+    return await r.json()
+  } catch (e) {
+    safeLog('crm.post.fail', { path, error: String((e && e.message) || e).slice(0, 120) })
+    return null
+  }
+}
+
+// Запрос уходит на внешний сайт — таймаут больше, чем у остальных вызовов CRM.
+function crmGraveSearch(payload) {
+  return crmPost('/api/bot/grave', payload, 12000)
+}
+
+// В callback_data телеграма влезает 64 байта, поэтому кнопка несёт только gid,
+// а карточка захоронения достаётся заново — из кэша CRM, без похода на epoisk.ru.
+function crmGravePick(gid) {
+  return crmPost('/api/bot/pick', { gid })
+}
+
+async function crmClients(projectId, opts = {}) {
+  const r = await crmPost('/api/bot/clients', { project_id: projectId, ...opts })
+  return (r && r.clients) || []
+}
+
+function htmlEscape(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+// Виджет на сайте показывает текст как есть — теги там были бы видны буквально.
+function htmlToPlain(s) {
+  return String(s ?? '')
+    .replace(/<a href="([^"]+)"[^>]*>([^<]*)<\/a>/g, '$2: $1')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+}
+
+// Выписка ДЛЯ ВЛАДЕЛЬЦА. Клиенту сама не уходит: совпадение по ФИО — ещё не та могила,
+// а цена ошибки несоизмерима с экономией одного сообщения. Отправляет человек кнопкой.
+function graveOwnerText(g, origin = 'по сообщению клиента') {
+  if (!g || !g.ok || !g.results || !g.results.length) return null
+  const rows = g.results.map((r) => {
+    const links = []
+    if (r.map_url) links.push(`<a href="${r.map_url}">план участка</a>`)
+    if (r.lat) links.push(`<a href="https://yandex.ru/maps/?pt=${r.lon},${r.lat}&z=18&l=sat">на карте</a>`)
+    const ins = (r.inscription || []).slice(0, 4).map((x) => htmlEscape(x)).join('\n     ')
+    return `📍 <b>${htmlEscape(r.uchastok)}</b> — ${htmlEscape(r.cemetery)}` +
+      (ins ? `\n     ${ins}` : '') +
+      (links.length ? `\n     ${links.join(' · ')}` : '')
+  })
+  const more = g.total > g.results.length
+    ? `\n\nВсего совпадений: ${g.total}, показаны первые ${g.results.length}.`
+    : ''
+  return `🔎 <b>Реестр захоронений — ${htmlEscape(origin)}</b>\n\n${rows.join('\n\n')}${more}`
+}
+
+// Текст, который уходит КЛИЕНТУ по кнопке. Формулировка намеренно вопросительная:
+// подтвердить участок может только тот, кто знает свою могилу.
+function graveClientText(r) {
+  const ins = (r.inscription || []).slice(0, 6).map((x) => `• ${htmlEscape(x)}`).join('\n')
+  const links = []
+  if (r.map_url) links.push(`<a href="${r.map_url}">план участка</a>`)
+  if (r.lat) links.push(`<a href="https://yandex.ru/maps/?pt=${r.lon},${r.lat}&z=18&l=sat">точка на карте</a>`)
+  return '🕯 Нашли совпадение в открытом реестре захоронений:\n\n' +
+    `📍 <b>Участок ${htmlEscape(r.uchastok)}</b> — ${htmlEscape(r.cemetery)}\n` +
+    (ins ? `\nНадпись на памятнике:\n${ins}\n` : '') +
+    (links.length ? `\n${links.join(' · ')}\n` : '') +
+    '\nПодскажите, пожалуйста, это тот самый участок? Совпадение по фамилии и имени — ещё не ' +
+    'подтверждение, поэтому перед работами мы сверим место на выезде и пришлём фото.'
+}
+
+// Одна кнопка на найденное захоронение. clientId известен — отправка в одно нажатие;
+// не известен (выписку поднял я сам своим сообщением) — сначала спросим кому.
+function graveKeyboard(results, clientId) {
+  const rows = (results || []).filter((r) => r.gid).map((r) => [{
+    text: `📤 Отправить клиенту: ${r.uchastok}`.slice(0, 60),
+    callback_data: clientId ? `gs:${r.gid}:${clientId}` : `gc:${r.gid}`,
+  }])
+  return rows.length ? { reply_markup: { inline_keyboard: rows } } : {}
+}
+
+// Карточки из веб-чата заводятся без имени — по одному id их не различить,
+// поэтому в подписи кнопки идёт последняя фраза клиента.
+function graveClientLabel(c) {
+  const who = c.name || c.contact || (c.last_text || '').trim() ||
+    (c.web_session ? 'чат сайта ' + String(c.web_session).slice(0, 8) : 'карточка ' + c.id)
+  const tail = c.cemetery ? ' · ' + c.cemetery : ''
+  return (String(who).replace(/\s+/g, ' ').slice(0, 40) + tail).slice(0, 60)
+}
+
 module.exports = {
   isValidUuid, fetchWithTimeout, safeLog, UUID_RE,
   getClientMeta, clientMetaBlockMd, parseUserAgent,
   classifyAttribution, attributionLineMd,
+  crmPost, crmGraveSearch, crmGravePick, crmClients,
+  htmlEscape, htmlToPlain,
+  graveOwnerText, graveClientText, graveKeyboard, graveClientLabel,
 }
