@@ -340,10 +340,16 @@ async function sendGraveToOwner(toChatId, g, botToken, clientId, origin, custome
   const found = graveOwnerText(g, origin)
   if (!found) {
     const who = g && g.fio ? ` по «${htmlEsc(g.fio)}»` : ''
+    // Пустой список значит две разные вещи. Реестр отдаёт ошибку молча — пустым
+    // ответом с source «error:», — и раньше сбой сети выглядел как достоверное
+    // «могилы в реестре нет». Для владельца это противоположные выводы.
     await sendMessage(toChatId,
-      `🔎 В реестре захоронений ничего не нашлось${who}.\n\n` +
-      '<i>Реестр открытый и неполный: у части старых могил надпись в нём не заведена. ' +
-      'Уточнить можно в конторе кладбища или на выезде.</i>',
+      g.degraded
+        ? `⚠️ Реестр захоронений не ответил${who} — поиск НЕ выполнен.\n\n` +
+          '<i>Это сбой сайта реестра, а не отсутствие записи. Повторить: /mogila с тем же текстом.</i>'
+        : `🔎 В реестре захоронений ничего не нашлось${who}.\n\n` +
+          '<i>Реестр открытый и неполный: у части старых могил надпись в нём не заведена. ' +
+          'Уточнить можно в конторе кладбища или на выезде.</i>',
       {}, botToken)
     return
   }
@@ -655,9 +661,22 @@ module.exports = async (req, res) => {
         }
 
         // Текстовый reply
-        await chatStore.message({
+        const saved = await chatStore.message({
           session_id: session.id, role: 'admin', text, tg_msg_id: replyToId,
         })
+        // chatStore.message при любом сбое возвращает null, а не бросает исключение.
+        // Раньше следом безусловно ставилась ✅, и владелец был уверен, что клиент
+        // получил ответ, — хотя записать его было некуда и клиент не увидит ничего.
+        if (!saved || !saved.ok) {
+          await sendMessage(
+            replierChatId,
+            '❌ <b>Ответ НЕ сохранился</b> — клиент его не увидит.\n\n' +
+            `<i>CRM не приняла запись. Текст цел, повтори отправку:</i>\n<code>${htmlEsc(text)}</code>`,
+            { reply_to_message_id: message.message_id },
+            sessionBotToken,
+          )
+          return res.status(200).send('OK')
+        }
         await sb(
           `web_chat_messages`,
           'POST',
