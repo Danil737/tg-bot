@@ -365,7 +365,9 @@ async function notifyOwnerEscalation(session, history, site = 'uhod-mogil', meta
     const patch = { status: 'escalated', tg_root_message_id: primaryMsgId }
     const extraEncoded = encodeExtraOwners(extraMsgIds)
     if (extraEncoded) patch.user_contact = extraEncoded
-    await sb(`web_chat_sessions?id=eq.${session.id}`, 'PATCH', patch)
+    // Статус и id уведомления живут в CRM; Supabase — зеркало и падать из-за него нельзя.
+    await chatStore.patch({ session_id: session.id, status: 'escalated', tg_root_message_id: primaryMsgId })
+    mirrorSupabase(() => sb(`web_chat_sessions?id=eq.${session.id}`, 'PATCH', patch))
   }
   return primaryMsgId
 }
@@ -472,7 +474,8 @@ module.exports = async (req, res) => {
           const patch = { tg_root_message_id: result.primaryMsgId }
           const extraEncoded = encodeExtraOwners(result.extraMsgIds)
           if (extraEncoded) patch.user_contact = extraEncoded
-          await sb(`web_chat_sessions?id=eq.${session.id}`, 'PATCH', patch)
+          await chatStore.patch({ session_id: session.id, tg_root_message_id: result.primaryMsgId })
+          mirrorSupabase(() => sb(`web_chat_sessions?id=eq.${session.id}`, 'PATCH', patch))
         }
       }
       return res.status(200).json({
