@@ -165,5 +165,24 @@ check('при незаписи галка ✅ не ставится',
   src.indexOf('Ответ НЕ сохранился') < src.indexOf('await reactOk(replierChatId, message.message_id, sessionBotToken)\n        // Broadcast to the OTHER owner') ||
   /Ответ НЕ сохранился[\s\S]{0,400}return res\.status\(200\)\.send\('OK'\)/.test(src))
 
+// --- заявка с формы не теряется при сбое телеграма ------------------------
+// Было: при !ok из sendToOwner стоял ранний return 500, а записи в CRM шли НИЖЕ —
+// заявка не попадала никуда, клиент видел «отправлено».
+const lead = require('fs').readFileSync(require('path').join(__dirname, '../api/lead.js'), 'utf8')
+check('нет раннего выхода при сбое телеграма',
+  !/const ok = await sendToOwner[\s\S]{0,80}return res\.status\(500\)/.test(lead))
+check('отправка обёрнута в try/catch', /try \{\s*\n\s*notified = await sendToOwner/.test(lead))
+check('запись в CRM выполняется после отправки всегда',
+  lead.indexOf('notified = await sendToOwner') < lead.indexOf('const inRu = await saveLeadToRuCrm'))
+check('есть запасная отправка простым текстом', lead.includes('sendPlainToOwner'))
+check('обратный слэш экранируется', lead.includes('/[\\\\*_`\\[\\]()~>#+=|{}.!-]/g'))
+check('502 только когда не сохранили И не доставили',
+  /!stored && !notified[\s\S]{0,220}status\(502\)/.test(lead))
+check('обе записи сообщают результат',
+  (lead.match(/return true/g) || []).length >= 2 && (lead.match(/return false/g) || []).length >= 4)
+check('есть проба для сторожа', lead.includes('req.query.probe'))
+check('проба проверяет и токен, и CRM',
+  /probe[\s\S]{0,400}BOT_TOKEN[\s\S]{0,300}CRM_URL/.test(lead))
+
 console.log(fails ? `\n${fails} проверок упало` : '\nвсе проверки прошли')
 process.exit(fails ? 1 : 0)

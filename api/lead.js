@@ -41,7 +41,10 @@ function setCors(req, res) {
 
 function escapeMd(s) {
   if (!s) return ''
-  return String(s).replace(/[*_`\[\]()~>#+=|{}.!-]/g, '\\$&')
+  // Обратный слэш обязан идти в классе ПЕРВЫМ и обязан быть: без него текст вида
+  // «C:\Users» или «3\4» уезжает в Telegram незаэкранированным, MarkdownV2 не
+  // разбирается, и вся отправка падает с ok:false.
+  return String(s).replace(/[\\*_`\[\]()~>#+=|{}.!-]/g, '\\$&')
 }
 
 // Parse a contact string and produce inline-keyboard buttons for instant reply
@@ -101,6 +104,39 @@ async function sendToOwner(text, replyMarkup) {
   return data.ok
 }
 
+// Запасная отправка простым текстом, без parse_mode.
+// Самая частая причина ok:false — сломанная разметка MarkdownV2 из-за символа
+// в тексте клиента. Гадать, какой именно символ, не нужно: некрасивое уведомление
+// лучше, чем никакого.
+async function sendPlainToOwner(text, replyMarkup) {
+  const body = { chat_id: OWNER_CHAT_ID, text, disable_web_page_preview: true }
+  if (replyMarkup) body.reply_markup = { inline_keyboard: replyMarkup }
+  const res = await fetchWithTimeout(
+    `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
+    6000,
+  )
+  const data = await res.json()
+  if (!data.ok) console.error('Telegram plain sendMessage failed:', data)
+  return data.ok
+}
+
+// То же тело заявки, но без разметки — для запасной отправки.
+function leadPlainText({ name, contact, service, cemetery, message, source }) {
+  return [
+    'НОВАЯ ЗАЯВКА с сайта uhod-mogil.ru',
+    '(форматирование не прошло, отправлено простым текстом)',
+    '',
+    `Имя: ${name}`,
+    `Контакт: ${contact}`,
+    service ? `Услуга: ${service}` : '',
+    cemetery ? `Кладбище: ${cemetery}` : '',
+    message ? `Комментарий: ${message}` : '',
+    '',
+    `тех. источник: ${source}`,
+  ].filter(Boolean).join('\n')
+}
+
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fxxmhnmvttvfatdlxpxk.supabase.co'
 const SUPABASE_SECRET = process.env.SUPABASE_SECRET_KEY
 
@@ -112,7 +148,7 @@ const SUPABASE_SECRET = process.env.SUPABASE_SECRET_KEY
 async function saveLeadToCrm({ name, contact, service, cemetery, message, source, body, req }) {
   if (!SUPABASE_SECRET) {
     console.error('[crm] SUPABASE_SECRET_KEY не задан — заявка не сохранена в CRM')
-    return
+    return false
   }
   try {
     const row = {
@@ -144,9 +180,12 @@ async function saveLeadToCrm({ name, contact, service, cemetery, message, source
     if (!r.ok) {
       const t = await r.text()
       console.error(`[crm] insert ${r.status}: ${t.slice(0, 200)}`)
+      return false
     }
+    return true
   } catch (e) {
     console.error('[crm] insert failed:', e && e.message)
+    return false
   }
 }
 
@@ -161,7 +200,7 @@ const CRM_URL = process.env.CRM_URL || ''
 const CRM_SECRET = process.env.CRM_SECRET || ''
 
 async function saveLeadToRuCrm({ name, contact, service, cemetery, message, source, page }) {
-  if (!CRM_URL || !CRM_SECRET) return
+  if (!CRM_URL || !CRM_SECRET) return false
   try {
     const r = await fetchWithTimeout(`${CRM_URL.replace(/\/+$/, '')}/api/lead`, {
       method: 'POST',
@@ -179,15 +218,42 @@ async function saveLeadToRuCrm({ name, contact, service, cemetery, message, sour
         landing: page || null,
       }),
     }, 5000)
-    if (!r.ok) console.error(`[ru-crm] lead ${r.status}: ${(await r.text()).slice(0, 160)}`)
+    if (!r.ok) {
+      console.error(`[ru-crm] lead ${r.status}: ${(await r.text()).slice(0, 160)}`)
+      return false
+    }
+    return true
   } catch (e) {
     console.error('[ru-crm] lead failed:', e && e.message)
+    return false
   }
 }
 
 module.exports = async (req, res) => {
   setCors(req, res)
   if (req.method === 'OPTIONS') return res.status(204).end()
+
+  // Проба для сторожа: GET /api/lead?probe=1.
+  // Обычный POST с пустым телом для этого не годится — валидация «имя и контакт
+  // обязательны» стоит выше проверок окружения, и 400 придёт даже со снятым
+  // BOT_TOKEN или CRM_URL, то есть сторож будет зелёным, пока заявки пропадают.
+  // Здесь проверяем именно то, без чего заявка теряется, и в телеграм ничего не шлём.
+  if (req.method === 'GET' && req.query && req.query.probe) {
+    const problems = []
+    if (!BOT_TOKEN) problems.push('BOT_TOKEN')
+    if (!CRM_URL || !CRM_SECRET) problems.push('CRM_URL/CRM_SECRET')
+    else {
+      try {
+        const r = await fetchWithTimeout(`${CRM_URL.replace(/\/+$/, '')}/api/health`, {}, 4000)
+        if (!r.ok) problems.push(`CRM ${r.status}`)
+      } catch (e) {
+        problems.push('CRM недоступна')
+      }
+    }
+    if (problems.length) return res.status(503).json({ ok: false, problems })
+    return res.status(200).json({ ok: true })
+  }
+
   if (req.method !== 'POST') return res.status(405).json({ ok: false, error: 'Method not allowed' })
 
   // Spam protection: limit per IP. Vercel forwards real IP in x-forwarded-for.
@@ -254,18 +320,50 @@ module.exports = async (req, res) => {
     // Build inline-keyboard buttons (only for leads — reviews don't need contact action)
     const replyMarkup = type === 'lead' ? buildContactButtons(contact, name) : null
 
-    const ok = await sendToOwner(text, replyMarkup)
-    if (!ok) return res.status(500).json({ ok: false, error: 'Telegram delivery failed' })
+    // Порядок вызовов НЕ меняем, хотя соблазн есть: у функции лимит 10 секунд
+    // (vercel.json), а таймауты Supabase 6с + CRM 5с + Telegram 6с в сумме больше.
+    // Поставь базы первыми — при их подвисании функцию убьют до отправки, и Daniil
+    // перестанет получать заявки в телеграм вообще. Сбой доставки лечим иначе.
+    let notified = false
+    try {
+      notified = await sendToOwner(text, replyMarkup)
+    } catch (e) {
+      console.error('Telegram недоступен:', e && e.message)
+    }
+    if (!notified && type === 'lead') {
+      try {
+        notified = await sendPlainToOwner(
+          leadPlainText({ name, contact, service, cemetery, message, source }), replyMarkup)
+      } catch (e) {
+        console.error('Запасная отправка тоже не прошла:', e && e.message)
+      }
+    }
 
     // Пишем заявку в CRM (панель /uhod в @my_claudebot_bot). Раньше заявка жила
     // только как сообщение в Telegram: пролистал — и клиент потерян.
     // Отзывы в CRM не кладём — это не заявка на работу.
+    //
+    // ⚠️ Запись стоит ПОСЛЕ отправки, но выполняется ВСЕГДА. Раньше тут был
+    // ранний `return 500` при сбое телеграма, и заявка не доезжала ни до одной базы:
+    // клиент видел «отправлено», а его контакта не было нигде.
+    let stored = false
     if (type === 'lead') {
-      await saveLeadToCrm({ name, contact, service, cemetery, message, source, body, req })
-      await saveLeadToRuCrm({ name, contact, service, cemetery, message, source, page: body.page || null })
+      const inCloud = await saveLeadToCrm({ name, contact, service, cemetery, message, source, body, req })
+      const inRu = await saveLeadToRuCrm({ name, contact, service, cemetery, message, source, page: body.page || null })
+      stored = Boolean(inCloud || inRu)
     }
 
-    return res.status(200).json({ ok: true })
+    // Честный ответ фронту: 200 только если заявку либо сохранили, либо доставили.
+    // Если не удалось ничего — клиенту нужно показать телефон, а не «спасибо».
+    if (type === 'lead' && !stored && !notified) {
+      console.error('[lead] ЗАЯВКА ПОТЕРЯНА: ни одна база не приняла, телеграм не ответил')
+      return res.status(502).json({ ok: false, error: 'Не удалось принять заявку' })
+    }
+    if (type === 'review' && !notified) {
+      return res.status(502).json({ ok: false, error: 'Telegram delivery failed' })
+    }
+
+    return res.status(200).json({ ok: true, notified, stored })
   } catch (e) {
     console.error('lead endpoint error:', e)
     return res.status(500).json({ ok: false, error: 'Internal error' })
