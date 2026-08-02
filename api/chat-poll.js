@@ -5,7 +5,7 @@
 // the widget ONCE on session creation). UUID alone is not enough — UUIDs leak
 // via screenshots, referrer headers, error logs.
 
-const { isValidUuid, fetchWithTimeout } = require('./_lib')
+const { isValidUuid, fetchWithTimeout, chatStore } = require('./_lib')
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fxxmhnmvttvfatdlxpxk.supabase.co'
 const SUPABASE_SECRET = process.env.SUPABASE_SECRET_KEY
@@ -72,6 +72,24 @@ module.exports = async (req, res) => {
     // Fetch session + verify token before returning messages.
     // select=* so the code keeps working before migration 002 is applied — the
     // session_token field will simply be undefined and we grandfather the session.
+    // Сначала CRM — она основное хранилище. Supabase остаётся запасным путём
+    // на случай, когда недоступна уже сама CRM.
+    const crm = await chatStore.history({
+      session_id: sessionId, token, limit: 200,
+      since_ts: safeSince ? Date.parse(safeSince) / 1000 : 0,
+    })
+    if (crm && crm.ok) {
+      return res.status(200).json({
+        ok: true,
+        messages: (crm.messages || []).map((m) => ({
+          role: m.role, content: m.content, created_at: m.created_at,
+          media_url: m.media_url || null, media_type: m.media_type || null,
+          media_group_id: null,
+        })),
+        status: crm.status === 'closed' ? 'closed' : (crm.status || 'active'),
+      })
+    }
+
     const sessRows = await sb(`web_chat_sessions?id=eq.${sessionId}&select=*`)
     if (!sessRows || sessRows.length === 0) {
       return res.status(404).json({ ok: false, error: 'Session not found' })

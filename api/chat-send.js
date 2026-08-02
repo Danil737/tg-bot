@@ -11,7 +11,7 @@
 
 const {
   isValidUuid, fetchWithTimeout, safeLog, getClientMeta, clientMetaBlockMd, attributionLineMd,
-  crmGraveSearch, graveOwnerText, graveKeyboard, graveShown,
+  crmGraveSearch, graveOwnerText, graveKeyboard, graveShown, chatStore,
 } = require('./_lib')
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fxxmhnmvttvfatdlxpxk.supabase.co'
@@ -42,27 +42,7 @@ function siteLabel(site) {
   return site === 'kissmyhands' ? 'Kiss My Hands' : 'УходМогил'
 }
 
-// Зеркало разговора в CRM. Раньше чат с сайта жил только в Supabase, и в карточке
-// клиента было видно ровно половину его истории: телеграм есть, чат с сайта нет —
-// а это тот самый разговор, где человек называет кладбище и имя покойного.
-//
-// Ключ склейки — id сессии: chat_id тут неоткуда взять. CRM не должна ломать чат:
-// короткий таймаут, ошибки только в лог.
-const CRM_URL = process.env.CRM_URL || ''
-const CRM_SECRET = process.env.CRM_SECRET || ''
-
-async function crmMirror(payload) {
-  if (!CRM_URL || !CRM_SECRET) return
-  try {
-    await fetchWithTimeout(`${CRM_URL.replace(/\/+$/, '')}/api/ingest`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-CRM-Secret': CRM_SECRET },
-      body: JSON.stringify(payload),
-    }, 3500)
-  } catch (e) {
-    safeLog('crm.mirror.fail', { error: String((e && e.message) || e).slice(0, 120) })
-  }
-}
+// Хранилище чата — CRM (chatStore в _lib.js), адрес и секрет она берёт сама.
 
 // Triggers escalation. Tolerant to flection ("передам/передаю менеджеру/специалисту")
 // and the leading checkmark fallback.
@@ -136,46 +116,71 @@ async function sb(path, method = 'GET', body = null, prefer = '') {
   return text ? JSON.parse(text) : null
 }
 
-async function getSession(sessionId) {
-  const rows = await sb(`web_chat_sessions?id=eq.${sessionId}&select=*`)
-  return rows?.[0] || null
+// Сессию заводит и подтверждает CRM. Supabase зеркалим следом и молча:
+// падение зеркала не должно ронять чат (ради этого всё и переделано).
+function _shape(r, meta) {
+  if (!r || !r.ok) return null
+  return {
+    id: r.session_id,
+    session_token: r.token,
+    status: r.status === 'escalated' ? 'escalated' : 'active',
+    source_url: (meta && meta.sourceUrl) || null,
+    tg_root_message_id: r.tg_root_message_id || null,
+    user_contact: null,
+    crm_client_id: r.client_id,
+  }
+}
+
+async function mirrorSupabase(fn) {
+  try {
+    await fn()
+  } catch (e) {
+    safeLog('supabase.mirror.fail', { error: String((e && e.message) || e).slice(0, 120) })
+  }
+}
+
+async function getSession(sessionId, token, meta) {
+  return _shape(await chatStore.session({
+    session_id: sessionId, token, site: (meta && meta.site) || '',
+    landing: (meta && meta.sourceUrl) || null,
+  }), meta)
 }
 
 async function createSession(meta) {
-  const rows = await sb(
-    `web_chat_sessions`,
-    'POST',
-    {
-      source_url: meta.sourceUrl?.slice(0, 500) || null,
-      user_agent: meta.userAgent?.slice(0, 500) || null,
-    },
-    'return=representation',
-  )
-  return rows[0]
+  const created = _shape(await chatStore.session({
+    site: meta.site || '', landing: meta.sourceUrl || null,
+  }), meta)
+  if (!created) throw new Error('CRM недоступна: сессию чата завести негде')
+  mirrorSupabase(() => sb(`web_chat_sessions`, 'POST', {
+    id: created.id,
+    session_token: created.session_token,
+    source_url: meta.sourceUrl?.slice(0, 500) || null,
+    user_agent: meta.userAgent?.slice(0, 500) || null,
+  }))
+  return created
 }
 
 async function getRecentMessages(sessionId, limit = 30) {
-  return await sb(
-    `web_chat_messages?session_id=eq.${sessionId}&order=created_at.asc&limit=${limit}&select=role,content,created_at,tg_message_id`,
-  )
+  const r = await chatStore.history({ session_id: sessionId, limit })
+  return (r && r.messages) || []
 }
 
 async function saveMessage(sessionId, role, content, tgMessageId = null) {
-  const rows = await sb(
-    `web_chat_messages`,
-    'POST',
-    { session_id: sessionId, role, content, tg_message_id: tgMessageId },
-    'return=representation',
-  )
-  return rows[0]
+  const r = await chatStore.message({
+    session_id: sessionId, role, text: content, tg_msg_id: tgMessageId,
+  })
+  if (!r || !r.ok) throw new Error('CRM недоступна: сообщение чата некуда записать')
+  mirrorSupabase(() => sb(`web_chat_messages`, 'POST',
+    { session_id: sessionId, role, content, tg_message_id: tgMessageId }))
+  return r
 }
 
 async function setSessionEscalated(sessionId, tgRootMessageId) {
-  await sb(
-    `web_chat_sessions?id=eq.${sessionId}`,
-    'PATCH',
-    { status: 'escalated', tg_root_message_id: tgRootMessageId },
-  )
+  await chatStore.patch({
+    session_id: sessionId, status: 'escalated', tg_root_message_id: tgRootMessageId,
+  })
+  mirrorSupabase(() => sb(`web_chat_sessions?id=eq.${sessionId}`, 'PATCH',
+    { status: 'escalated', tg_root_message_id: tgRootMessageId }))
 }
 
 async function aiReply(history, userMessage) {
@@ -367,17 +372,11 @@ async function notifyOwnerEscalation(session, history, site = 'uhod-mogil', meta
 
 // Soft per-session rate limit: too many user messages in a short window
 // usually means a bot or someone scripting. Block AI calls but keep session usable.
+// Частоту считает CRM тем же запросом, что отдаёт историю: отдельный поход
+// в базу за счётчиком был лишним ещё до всей истории с квотой.
 async function isRateLimited(sessionId) {
-  try {
-    const since = new Date(Date.now() - RATE_WINDOW_MS).toISOString()
-    const rows = await sb(
-      `web_chat_messages?session_id=eq.${sessionId}&role=eq.user&created_at=gte.${encodeURIComponent(since)}&select=id`,
-    )
-    return (rows?.length || 0) >= RATE_MAX
-  } catch {
-    // Don't fail the request if the rate-limit check itself fails.
-    return false
-  }
+  const r = await chatStore.history({ session_id: sessionId, limit: 1 })
+  return !!r && (r.user_last_60s || 0) > RATE_MAX
 }
 
 module.exports = async (req, res) => {
@@ -408,7 +407,7 @@ module.exports = async (req, res) => {
       if (incomingToken && !isValidUuid(incomingToken)) {
         return res.status(400).json({ ok: false, error: 'Invalid token' })
       }
-      session = await getSession(incomingSessionId)
+      session = await getSession(incomingSessionId, incomingToken, { sourceUrl, site })
       // If session has a token but request doesn't match — DON'T 403 (would
       // strand legitimate users whose browser missed the token on first save,
       // or who had sessions auto-tokenized by migration 002). Instead, silently
@@ -419,7 +418,7 @@ module.exports = async (req, res) => {
       }
     }
     if (!session) {
-      session = await createSession({ sourceUrl, userAgent })
+      session = await createSession({ sourceUrl, userAgent, site })
     }
 
     // Rate-limit AFTER session resolution (so we know whose limit to check)
@@ -427,15 +426,9 @@ module.exports = async (req, res) => {
       return res.status(429).json({ ok: false, error: 'Too many messages. Please wait a minute.' })
     }
 
-    // Save user message
+    // Сообщение клиента. Пишем в CRM напрямую — отдельного зеркала через /api/ingest
+    // больше нет, иначе одно и то же сообщение легло бы в карточку дважды.
     await saveMessage(session.id, 'user', message.trim())
-    await crmMirror({
-      project_id: site === 'kissmyhands' ? 'kissmyhands' : 'uhod-mogil',
-      web_session: session.id,
-      text: message.trim(),
-      landing: session.source_url || sourceUrl || null,
-      source: 'чат на сайте',
-    })
 
     // Данные покойного приходят и в ПЕРВОМ сообщении, до всякой эскалации — поэтому
     // поиск стоит здесь, а не в ветке «чат уже передан менеджеру».
@@ -504,15 +497,6 @@ module.exports = async (req, res) => {
     }
 
     await saveMessage(session.id, 'ai', aiText)
-    await crmMirror({
-      project_id: site === 'kissmyhands' ? 'kissmyhands' : 'uhod-mogil',
-      web_session: session.id,
-      direction: 'out',
-      text: aiText,
-      author_label: 'Автоответчик сайта',
-      landing: session.source_url || sourceUrl || null,
-      source: 'чат на сайте',
-    })
 
     if (ESCALATION_RE.test(aiText)) {
       escalate = true

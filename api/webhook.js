@@ -2,7 +2,7 @@ const {
   fetchWithTimeout, safeLog,
   crmGraveSearch, crmGravePick, crmClients,
   htmlToPlain, graveOwnerText, graveClientText, graveKeyboard, graveClientLabel, graveShown,
-  graveCopyText, graveConfirmKeyboard, graveRow,
+  graveCopyText, graveConfirmKeyboard, graveRow, chatStore,
   looksLikeGraveText,
 } = require('./_lib')
 
@@ -468,26 +468,31 @@ async function handleGraveCallback(cq, incomingBot, botToken) {
     } else if (client.web_session) {
       // return=representation обязателен: на обычной вставке Supabase отвечает пустым
       // телом, sb() отдаёт null — и успешная отправка была бы прочитана как отказ.
-      const w = await sb('web_chat_messages', 'POST', {
-        session_id: client.web_session,
-        role: 'admin',
-        content: htmlToPlain(body),
-      }, 'return=representation')
-      ok = Array.isArray(w) ? w.length > 0 : w !== null
+      const w = await chatStore.message({
+        session_id: client.web_session, role: 'admin', text: htmlToPlain(body),
+      })
+      ok = !!(w && w.ok)
+      if (ok) {
+        await sb('web_chat_messages', 'POST', {
+          session_id: client.web_session, role: 'admin', content: htmlToPlain(body),
+        }).catch(() => {})
+      }
     }
     if (!ok) {
       await answerCallback(cq.id, 'Отправить не удалось — открой карточку в CRM', botToken, true)
       return
     }
-    await crmIngest({
-      project_id: client.project_id || crmProject(incomingBot),
-      tg_chat_id: client.tg_chat_id || undefined,
-      web_session: client.web_session || undefined,
-      direction: 'out',
-      text: htmlToPlain(body),
-      author_label: 'Выписка из реестра · отправлена клиенту',
-      source: client.web_session ? 'чат на сайте' : 'telegram',
-    })
+    // Веб-клиенту выписка уже записана chatStore.message; телеграм-клиенту пишем ingest'ом.
+    if (client.tg_chat_id) {
+      await crmIngest({
+        project_id: client.project_id || crmProject(incomingBot),
+        tg_chat_id: client.tg_chat_id,
+        direction: 'out',
+        text: htmlToPlain(body),
+        author_label: 'Выписка из реестра · отправлена клиенту',
+        source: 'telegram',
+      })
+    }
     await editReplyMarkup(chatId, msgId, {
       inline_keyboard: [[{ text: `✅ Отправлено — ${graveClientLabel(client)}`, callback_data: 'noop' }]],
     }, botToken)
@@ -577,10 +582,18 @@ module.exports = async (req, res) => {
 
     // Path 1: web-chat session reply (find session by tg_root_message_id OR by
     // user_contact-encoded extra-owner msg_id).
-    if (SUPABASE_SECRET) {
-      let sessions = await sb(
-        `web_chat_sessions?tg_root_message_id=eq.${replyToId}&select=id,status,source_url,user_contact`,
-      )
+    // Сессию ищем в CRM — она основное хранилище чата с сайта. Supabase остаётся
+    // запасным путём и единственным местом, где живёт раскладка уведомлений Сергея.
+    {
+      const viaCrm = await chatStore.byRoot(replyToId)
+      let sessions = viaCrm && viaCrm.ok
+        ? [{ id: viaCrm.session_id, status: viaCrm.status, source_url: viaCrm.landing, user_contact: null }]
+        : null
+      if (!sessions && SUPABASE_SECRET) {
+        sessions = await sb(
+          `web_chat_sessions?tg_root_message_id=eq.${replyToId}&select=id,status,source_url,user_contact`,
+        )
+      }
       // If not found by primary tg_root_message_id, look up via extra-owner mapping.
       // Сергей's reply has reply_to_message.message_id = его копии notification,
       // которая записана в user_contact как "extra:<chat_id>:<msg_id>;..."
@@ -609,6 +622,10 @@ module.exports = async (req, res) => {
             return res.status(200).send('OK')
           }
 
+          await chatStore.message({
+            session_id: session.id, role: 'admin', text: caption || '',
+            tg_msg_id: replyToId, media_kind: 'photo', media_ref: photoUrl,
+          })
           await sb(
             `web_chat_messages`,
             'POST',
@@ -621,19 +638,9 @@ module.exports = async (req, res) => {
               media_type: 'photo',
               media_group_id: mediaGroupId,
             },
-          )
+          ).catch(() => {})
 
-          await crmIngest({
-            project_id: crmProject(sessionSite === 'kmh' ? 'kmh' : 'uhod'),
-            web_session: session.id,
-            direction: 'out',
-            text: caption || '',
-            media_kind: 'photo',
-            media_ref: largestPhoto.file_id,
-            author_label: replierChatId === OWNER_CHAT_ID ? 'Менеджер УходМогил' : 'Сергей',
-            landing: session.source_url || null,
-            source: 'чат на сайте',
-          })
+          // в CRM это уже записано выше через chatStore.message — второй раз не надо
           // Подтверждение — реакцией на само сообщение владельца (и для альбома тоже:
           // иначе каждое фото из альбома отвечало отдельной строкой)
           await reactOk(replierChatId, message.message_id, sessionBotToken)
@@ -648,22 +655,15 @@ module.exports = async (req, res) => {
         }
 
         // Текстовый reply
+        await chatStore.message({
+          session_id: session.id, role: 'admin', text, tg_msg_id: replyToId,
+        })
         await sb(
           `web_chat_messages`,
           'POST',
           { session_id: session.id, role: 'admin', content: text, tg_message_id: replyToId },
-        )
-        // И в CRM: разговор с сайта до сих пор жил только в Supabase, поэтому в карточке
-        // была видна половина истории клиента — телеграм есть, чат с сайта нет.
-        await crmIngest({
-          project_id: crmProject(sessionSite === 'kmh' ? 'kmh' : 'uhod'),
-          web_session: session.id,
-          direction: 'out',
-          text: text || '',
-          author_label: replierChatId === OWNER_CHAT_ID ? 'Менеджер УходМогил' : 'Сергей',
-          landing: session.source_url || null,
-          source: 'чат на сайте',
-        })
+        ).catch(() => {})
+        // в CRM это уже записано выше через chatStore.message — второй раз не надо
         await reactOk(replierChatId, message.message_id, sessionBotToken)
         // Broadcast to the OTHER owner so both Daniil and Sergey see the conversation.
         const replierLabel = replierChatId === OWNER_CHAT_ID ? 'Daniil' : 'Сергей'

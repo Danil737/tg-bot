@@ -179,6 +179,19 @@ function attributionLineMd(attr) {
 }
 
 
+// --- Хранилище чата с сайта ---------------------------------------------------
+// ОСНОВНОЕ — CRM на нашем РФ-сервере, Supabase остаётся зеркалом «по возможности».
+// 02.08.2026 Supabase бесплатного тарифа упёрся в квоту egress, начал отдавать 402
+// на любой запрос и утащил за собой виджет на сайте — хотя переписка уже лежала в CRM.
+// Читаем всегда из CRM: два источника правды и «а где свежее» нам не нужны.
+const chatStore = {
+  session: (p) => crmPost('/api/web/session', p),
+  message: (p) => crmPost('/api/web/message', p),
+  history: (p) => crmPost('/api/web/messages', p),
+  patch: (p) => crmPost('/api/web/session/patch', p),
+  byRoot: (id) => crmPost('/api/web/by-root', { tg_root_message_id: id }),
+}
+
 // --- Реестр захоронений (epoisk.ru через CRM) --------------------------------
 // Сам поиск живёт в CRM: там кэш на 14 дней, пауза между запросами к чужому сайту и
 // разбор выдачи. Бот только спрашивает и показывает — второй копии парсера нет.
@@ -407,7 +420,7 @@ module.exports = {
   isValidUuid, fetchWithTimeout, safeLog, UUID_RE,
   getClientMeta, clientMetaBlockMd, parseUserAgent,
   classifyAttribution, attributionLineMd,
-  crmPost, crmGraveSearch, crmGravePick, crmClients,
+  crmPost, crmGraveSearch, crmGravePick, crmClients, chatStore,
   htmlEscape, htmlToPlain,
   graveOwnerText, graveClientText, graveKeyboard, graveClientLabel, graveShown,
   graveCopyText, graveConfirmKeyboard, uchastokShort, uchastokLabel, graveRow,
