@@ -522,6 +522,31 @@ module.exports = async (req, res) => {
     })
   } catch (e) {
     console.error('chat-send error:', e.message)
+    // Хранилище отвалилось — но человек УЖЕ написал, и потерять его нельзя.
+    // 02.08.2026 чат лежал несколько часов, и всё, что писали в это окно, исчезло
+    // молча: ни в базе, ни в телеграме следа. Теперь текст в любом случае уходит
+    // владельцу — пусть без карточки, зато не в никуда.
+    try {
+      const failSite = detectSite((req.body && req.body.sourceUrl) || req.headers.origin || '')
+      const failToken = botTokenForSite(failSite)
+      const failText = String((req.body && req.body.message) || '').slice(0, 1500)
+      if (failToken && failText) {
+        await fetchWithTimeout(`https://api.telegram.org/bot${failToken}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: OWNER_CHAT_ID,
+            text: '\u26a0\ufe0f <b>Чат на сайте не сохранил сообщение</b> — ответить надо вручную\n\n'
+              + '\ud83d\udcac ' + failText.replace(/</g, '&lt;')
+              + '\n\n<i>Причина: ' + String((e && e.message) || e).slice(0, 120) + '</i>',
+            parse_mode: 'HTML',
+            disable_web_page_preview: true,
+          }),
+        }, 6000)
+      }
+    } catch (notifyErr) {
+      console.error('chat-send fallback notify failed:', notifyErr.message)
+    }
     return res.status(500).json({ ok: false, error: 'Internal error' })
   }
 }
