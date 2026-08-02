@@ -78,6 +78,11 @@ module.exports = async (req, res) => {
       session_id: sessionId, token, limit: 200,
       since_ts: safeSince ? Date.parse(safeSince) / 1000 : 0,
     })
+    // CRM ответила «такой сессии нет» — это ответ, а не сбой: в Supabase за ней
+    // ходить незачем (и именно он 02.08 отдавал 402 на всё).
+    if (crm && crm.ok === false && crm.error === 'no session') {
+      return res.status(404).json({ ok: false, error: 'Session not found' })
+    }
     if (crm && crm.ok) {
       return res.status(200).json({
         ok: true,
