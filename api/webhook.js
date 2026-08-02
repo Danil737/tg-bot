@@ -2,6 +2,7 @@ const {
   fetchWithTimeout, safeLog,
   crmGraveSearch, crmGravePick, crmClients,
   htmlToPlain, graveOwnerText, graveClientText, graveKeyboard, graveClientLabel, graveShown,
+  graveCopyText, graveConfirmKeyboard, graveRow,
   looksLikeGraveText,
 } = require('./_lib')
 
@@ -355,8 +356,8 @@ async function sendGraveToOwner(toChatId, g, botToken, clientId, origin, custome
     (g.cemetery ? '' : '\n\n⚠️ Кладбище не названо — это совпадения по всей Москве.') +
     (customerChatId ? `\n\nchatid: ${customerChatId}` : '') +
     cardLink +
-    '\n\n↩️ <i>Клиенту не отправлено — кнопка ниже.</i>',
-    { disable_web_page_preview: true, ...graveKeyboard(graveShown(g), clientId) },
+    '\n\n↩️ <i>Клиенту не отправлено. «📋 Текст» — скопировать для MAX, вацапа или мастера; «📤 Клиенту» — отправить отсюда, спросит подтверждение.</i>',
+    { disable_web_page_preview: true, ...graveKeyboard(g, clientId) },
     botToken)
 }
 
@@ -393,8 +394,63 @@ async function handleGraveCallback(cq, incomingBot, botToken) {
     return
   }
 
-  // Шаг 2: отправка выписки клиенту тем же каналом, которым он пишет сам.
+  // Текст для копирования: клиент может сидеть в MAX или вацапе, куда бот не пишет,
+  // да и мастеру место отправляется руками.
+  if (data.startsWith('gt:')) {
+    const pick = await crmGravePick(data.slice(3))
+    if (!pick || !pick.ok) {
+      await answerCallback(cq.id, 'Не нашёл данные — открой карточку в CRM', botToken, true)
+      return
+    }
+    await sendMessage(chatId, graveCopyText(pick.result), { disable_web_page_preview: true }, botToken)
+    await answerCallback(cq.id, 'Ниже — нажми на текст, скопируется', botToken)
+    return
+  }
+
+  // Раскрыть вариант из списка: отдельная карточка со своими кнопками.
+  if (data.startsWith('gp:')) {
+    const [, gid, cid] = data.split(':')
+    const pick = await crmGravePick(gid)
+    if (!pick || !pick.ok) {
+      await answerCallback(cq.id, 'Не нашёл данные — открой карточку в CRM', botToken, true)
+      return
+    }
+    await sendMessage(chatId, `🔎 <b>Вариант из списка</b>\n\n${graveRow(pick.result, true)}`,
+      { disable_web_page_preview: true, ...graveKeyboard([pick.result], cid ? Number(cid) : null) },
+      botToken)
+    await answerCallback(cq.id, '', botToken)
+    return
+  }
+
+  // Отмена подтверждения — возвращаем обычные кнопки.
+  if (data.startsWith('gx:')) {
+    const [, gid, cid] = data.split(':')
+    const pick = await crmGravePick(gid)
+    if (pick && pick.ok) {
+      const kb = graveKeyboard([pick.result], Number(cid))
+      await editReplyMarkup(chatId, msgId, kb.reply_markup, botToken)
+    }
+    await answerCallback(cq.id, 'Отменено, клиенту ничего не ушло', botToken)
+    return
+  }
+
+  // Шаг 2: показываем, ЧТО и КОМУ уйдёт. Сама отправка — только по «Да».
   if (data.startsWith('gs:')) {
+    const [, gid, cid] = data.split(':')
+    const pick = await crmGravePick(gid)
+    const r = pick && pick.ok ? pick.result : null
+    const client = (await crmClients(crmProject(incomingBot), { id: Number(cid) }))[0]
+    if (!r || !client) {
+      await answerCallback(cq.id, 'Не нашёл данные — открой карточку в CRM', botToken, true)
+      return
+    }
+    await editReplyMarkup(chatId, msgId, graveConfirmKeyboard(r, client), botToken)
+    await answerCallback(cq.id, 'Проверьте кому — и подтвердите', botToken)
+    return
+  }
+
+  // Шаг 3: подтверждено — отправка тем же каналом, которым клиент пишет сам.
+  if (data.startsWith('gy:')) {
     const [, gid, cid] = data.split(':')
     const pick = await crmGravePick(gid)
     const r = pick && pick.ok ? pick.result : null

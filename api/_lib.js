@@ -251,53 +251,81 @@ function graveNames(r) {
   return (r.inscription || []).filter((s) => /[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+/.test(s))
 }
 
+function uchastokShort(u) {
+  const p = String(u || '').split('/')
+  return p.length >= 4 ? `уч. ${p[2]}, мог. ${p[3]}` : String(u || '')
+}
+
+// Ссылки к одному захоронению. Карточка в реестре — единственное место, где бывает
+// фото памятника; тянуть её автоматом нельзя (robots.txt epoisk закрывает /burmsk/?gid=),
+// поэтому даём ссылку: открывается руками — и мной, и клиентом.
+function graveLinks(r, full) {
+  const out = []
+  if (r.map_url) out.push(`<a href="${r.map_url}">план участка</a>`)
+  if (r.lat) out.push(`<a href="https://yandex.ru/maps/?pt=${r.lon},${r.lat}&z=18&l=sat">спутник</a>`)
+  if (r.lat && full) {
+    out.push(`<a href="https://yandex.ru/maps/?rtext=~${r.lat},${r.lon}&rtt=auto">маршрут</a>`)
+  }
+  if (r.card_url && full) out.push(`<a href="${r.card_url}">карточка в реестре</a>`)
+  return out
+}
+
+const GRAVE_NUM = ['1\uFE0F\u20E3', '2\uFE0F\u20E3', '3\uFE0F\u20E3', '4\uFE0F\u20E3',
+                   '5\uFE0F\u20E3', '6\uFE0F\u20E3', '7\uFE0F\u20E3', '8\uFE0F\u20E3']
+// Восемь — потолок и по читаемости, и по кнопкам. Однофамильцев бывает и сотня:
+// без потолка одно сообщение вырастет за лимит телеграма и не уйдёт вообще.
+const GRAVE_MAX = 8
+
+// Полная карточка одного захоронения.
 function graveRow(r, full) {
   const names = graveNames(r).slice(0, full ? 4 : 2).map((x) => `   ${htmlEscape(x)}`)
-  const links = []
-  if (r.map_url) links.push(`<a href="${r.map_url}">план участка</a>`)
-  if (r.lat) links.push(`<a href="https://yandex.ru/maps/?pt=${r.lon},${r.lat}&z=18&l=sat">карта</a>`)
+  const links = graveLinks(r, full)
   return `📍 <b>${htmlEscape(uchastokLabel(r.uchastok))}</b>  <code>${htmlEscape(r.uchastok)}</code>` +
     (names.length ? `\n${names.join('\n')}` : '') +
     ((r.why || []).length ? `\n   ✅ ${htmlEscape(r.why.join(' · '))}` : '') +
     (links.length ? `\n   ${links.join(' · ')}` : '')
 }
 
-// Выписка ДЛЯ ВЛАДЕЛЬЦА. Клиенту сама не уходит: совпадение по ФИО — ещё не та могила,
-// а цена ошибки несоизмерима с экономией одного сообщения. Отправляет человек кнопкой.
-//
-// Однофамильцы в выдаче есть почти всегда, и три полные карточки подряд — это стена
-// текста, в которой не видно ответа. Если одна строка сошлась с текстом клиента
-// (номер участка, второе имя в той же могиле) — показываем её одну.
-// Что реально показываем. Кнопок должно быть ровно столько же: иначе под ответом
-// с одним участком висят три кнопки и непонятно, что уйдёт клиенту.
-function graveShown(g) {
-  if (!g || !g.ok || !g.results || !g.results.length) return []
-  const rs = g.results
-  const best = rs[0]
-  const decisive = (best.score || 0) >= 3 && (rs.length < 2 || (best.score || 0) > (rs[1].score || 0))
-  return decisive ? [best] : rs
+// Строка списка: номер, участок, кто лежит. Раскрывается кнопкой с тем же номером.
+function graveLine(r, i) {
+  const who = graveNames(r).slice(0, 2).join(' · ').slice(0, 90)
+  return `${GRAVE_NUM[i] || `${i + 1}.`} <b>${htmlEscape(uchastokShort(r.uchastok))}</b>` +
+    (who ? ` — ${htmlEscape(who)}` : '') +
+    ((r.why || []).length ? ' ✅' : '')
 }
 
+// Показываем ВСЕ найденное (до потолка), но первым — то, что сошлось с текстом клиента.
+function graveShown(g) {
+  if (!g || !g.ok || !g.results || !g.results.length) return []
+  return g.results.slice(0, GRAVE_MAX)
+}
+
+// Выписка ДЛЯ ВЛАДЕЛЬЦА. Клиенту сама не уходит: совпадение по ФИО — ещё не та могила,
+// а цена ошибки несоизмерима с экономией одного сообщения. Отправляет человек кнопкой.
 function graveOwnerText(g, origin = 'по сообщению клиента') {
   const shown = graveShown(g)
   if (!shown.length) return null
+  const best = shown[0]
+  const sure = (best.score || 0) > 0
   const head = `🔎 <b>${htmlEscape(g.cemetery || 'Реестр захоронений')}</b> · <i>${htmlEscape(origin)}</i>`
-  if (shown.length === 1 && g.results.length > 1) {
-    const rest = (g.total || 1) - 1
-    return `${head}\n\n${graveRow(shown[0], true)}` +
-      `\n\n<i>Ещё ${rest} по фамилии — по участку и второму имени не сходятся.</i>`
-  }
-  const more = g.total > shown.length ? `\n\n<i>Всего ${g.total}, показаны ${shown.length}.</i>` : ''
-  return `${head}\n\n${shown.map((r) => graveRow(r, shown.length === 1)).join('\n\n')}${more}`
+  const rest = shown.slice(1)
+  const restBlock = rest.length
+    ? `\n\n<i>${sure ? 'Остальные по фамилии' : 'Другие варианты'}:</i>\n` +
+      rest.map((r, i) => graveLine(r, i + 1)).join('\n') +
+      '\n\n<i>Кнопка с номером — раскрыть вариант.</i>'
+    : ''
+  const cut = (g.total || shown.length) > shown.length
+    ? `\n\n⚠️ <i>Всего совпадений ${g.total} — показаны первые ${shown.length}. ` +
+      'Уточните отчество, год или кладбище.</i>'
+    : ''
+  return `${head}\n\n${graveRow(best, true)}${restBlock}${cut}`
 }
 
-// Текст, который уходит КЛИЕНТУ по кнопке. Формулировка намеренно вопросительная:
-// подтвердить участок может только тот, кто знает свою могилу.
+// Текст, который уходит КЛИЕНТУ. Формулировка намеренно вопросительная: подтвердить
+// участок может только тот, кто знает свою могилу.
 function graveClientText(r) {
   const ins = graveNames(r).slice(0, 6).map((x) => `• ${htmlEscape(x)}`).join('\n')
-  const links = []
-  if (r.map_url) links.push(`<a href="${r.map_url}">план участка</a>`)
-  if (r.lat) links.push(`<a href="https://yandex.ru/maps/?pt=${r.lon},${r.lat}&z=18&l=sat">точка на карте</a>`)
+  const links = graveLinks(r, true)
   return '🕯 Нашли в открытом реестре захоронений:\n\n' +
     `📍 <b>${htmlEscape(r.cemetery)} кладбище, ${htmlEscape(uchastokLabel(r.uchastok))}</b>\n` +
     (ins ? `\nНадпись на памятнике:\n${ins}\n` : '') +
@@ -306,16 +334,53 @@ function graveClientText(r) {
     'подтверждение, поэтому перед работами мы сверим место на выезде и пришлём фото.'
 }
 
-// Одна кнопка на найденное захоронение. clientId известен — отправка в одно нажатие;
-// не известен (выписку поднял я сам своим сообщением) — сначала спросим кому.
-function graveKeyboard(results, clientId) {
-  const rows = (results || []).filter((r) => r.gid).map((r) => [{
-    text: ((results || []).length > 1
-      ? `📤 Клиенту: ${uchastokLabel(r.uchastok)}`
-      : '📤 Отправить клиенту').slice(0, 60),
-    callback_data: clientId ? `gs:${r.gid}:${clientId}` : `gc:${r.gid}`,
-  }])
-  return rows.length ? { reply_markup: { inline_keyboard: rows } } : {}
+// «Отправить в другом мессенджере» — значит скопировать. В телеграме нажатие по <code>
+// копирует блок целиком, поэтому текст идёт именно так, а не обычным абзацем.
+// Два блока: клиенту — с вопросом и оговоркой, мастеру — только место.
+function graveCopyText(r) {
+  const forClient = htmlToPlain(graveClientText(r))
+  const short = `${r.cemetery} кладбище, ${uchastokLabel(r.uchastok)} (${r.uchastok})` +
+    (r.lat ? `, координаты ${r.lat}, ${r.lon}` : '')
+  return '📋 <b>Клиенту</b> — нажми на текст, скопируется целиком:\n\n' +
+    `<code>${htmlEscape(forClient)}</code>\n\n` +
+    '🔧 <b>Мастеру</b> — только место:\n\n' +
+    `<code>${htmlEscape(short)}</code>`
+}
+
+// Первая строка кнопок — что делать с показанной карточкой, вторая и дальше — номера
+// остальных вариантов. clientId известен — отправка спросит подтверждение; не известен
+// (выписку я поднял своим сообщением) — сначала спросим кому, подтверждение всё равно будет.
+function graveKeyboard(g, clientId) {
+  const shown = Array.isArray(g) ? g : graveShown(g)
+  const best = shown[0]
+  if (!best || !best.gid) return {}
+  const rows = [[
+    { text: '📋 Текст для отправки', callback_data: `gt:${best.gid}` },
+    {
+      text: '📤 Отправить клиенту',
+      callback_data: clientId ? `gs:${best.gid}:${clientId}` : `gc:${best.gid}`,
+    },
+  ]]
+  const nums = shown.slice(1).filter((r) => r.gid).map((r, i) => ({
+    text: GRAVE_NUM[i + 1] || `${i + 2}`,
+    callback_data: clientId ? `gp:${r.gid}:${clientId}` : `gp:${r.gid}`,
+  }))
+  for (let i = 0; i < nums.length; i += 4) rows.push(nums.slice(i, i + 4))
+  return { reply_markup: { inline_keyboard: rows } }
+}
+
+// Отправка клиенту необратима, поэтому в два нажатия: первое показывает, ЧТО и КОМУ
+// уйдёт, и только второе отправляет. Промахнуться по соседней кнопке в списке
+// из шести карточек иначе слишком легко.
+function graveConfirmKeyboard(r, client) {
+  return {
+    inline_keyboard: [
+      [{ text: `⚠️ ${uchastokShort(r.uchastok)} → ${graveClientLabel(client)}`.slice(0, 60),
+         callback_data: 'noop' }],
+      [{ text: '✅ Да, отправить', callback_data: `gy:${r.gid}:${client.id}` },
+       { text: '✖️ Отмена', callback_data: `gx:${r.gid}:${client.id}` }],
+    ],
+  }
 }
 
 // Стоит ли вообще идти в реестр по СВОБОДНОМУ тексту владельца. Название кладбища —
@@ -345,5 +410,6 @@ module.exports = {
   crmPost, crmGraveSearch, crmGravePick, crmClients,
   htmlEscape, htmlToPlain,
   graveOwnerText, graveClientText, graveKeyboard, graveClientLabel, graveShown,
+  graveCopyText, graveConfirmKeyboard, uchastokShort, uchastokLabel, graveRow,
   looksLikeGraveText,
 }
