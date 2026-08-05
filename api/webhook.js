@@ -329,11 +329,14 @@ async function sendGraveToOwner(toChatId, g, botToken, clientId, origin, custome
   // нечем и незачем: «кладбище» и «участок» я пишу в чат и по другим поводам, а лишний
   // ответ на каждый из них быстро приучает не читать бота. Явный /mogila — другое дело.
   if (!g || g.need === 'fio') {
-    if (quietIfNoFio) return
+    // Молчать нельзя: 05.08 запрос «Домодедовское кладбище. Бялясинский» остался без
+    // единого слова в ответ, и со стороны это неотличимо от проглоченного сообщения.
+    // Ответ короткий — если текст был не про поиск, одна строка не мешает.
     await sendMessage(toChatId,
       !g
         ? '⚠️ CRM не ответила — поиск по реестру сейчас недоступен.'
-        : '🔎 Нужны хотя бы фамилия и имя:\n<code>/mogila Фамилия Имя Отчество, кладбище</code>',
+        : '🔎 Не понял, кого искать. Хватит одной фамилии от 4 букв:\n' +
+          '<code>/mogila Фамилия, кладбище</code>',
       {}, botToken)
     return
   }
@@ -793,7 +796,8 @@ module.exports = async (req, res) => {
   if (ALL_OWNER_IDS.has(chatId) && incomingBot !== 'kmh' && text && !text.startsWith('/') &&
       looksLikeGraveText(text)) {
     const g = await crmGraveSearch({ project_id: crmProject(incomingBot), text })
-    await sendGraveToOwner(chatId, g, incomingBotToken, null, 'по вашему сообщению', null, true)
+    // false: на свой запрос владелец получает ответ всегда, даже «не понял, кого искать».
+    await sendGraveToOwner(chatId, g, incomingBotToken, null, 'по вашему сообщению', null, false)
     return res.status(200).send('OK')
   }
 
