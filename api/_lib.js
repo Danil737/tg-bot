@@ -221,9 +221,13 @@ async function crmPost(path, payload, timeoutMs = 6000) {
   }
 }
 
-// Запрос уходит на внешний сайт — таймаут больше, чем у остальных вызовов CRM.
+// Запрос уходит на ДВА внешних реестра сразу (московский epoisk и подмосковный ГУРБ),
+// они опрашиваются параллельно, но московский идёт каскадом (полное ФИО → фамилия →
+// маска на случай опечатки в реестре → годы), а подмосковный отвечает медленно
+// и с зависаниями. Замер на живых запросах: до ~12 с. Двенадцати секунд не хватало —
+// поиск обрывался ровно на тех случаях, ради которых каскад и делался.
 function crmGraveSearch(payload) {
-  return crmPost('/api/bot/grave', payload, 12000)
+  return crmPost('/api/bot/grave', payload, 25000)
 }
 
 // В callback_data телеграма влезает 64 байта, поэтому кнопка несёт только gid,
@@ -251,8 +255,14 @@ function htmlToPlain(s) {
     .replace(/&amp;/g, '&')
 }
 
+// Два реестра, и они не пересекаются: московские кладбища только в одном,
+// подмосковные только в другом. Оператору важно знать, откуда запись.
+const REGISTRY_NAME = { msk: 'реестр Москвы', mo: 'реестр Подмосковья' }
+
 // «ЗИ/037/23/0996» — это код реестра, а спрашивают всегда про участок и могилу.
 // Показываем словами, код оставляем мелким: по нему потом ищут в конторе кладбища.
+// Подмосковный реестр отдаёт место иначе — сразу словами («сектор 6, ряд 6, место 2158»),
+// такую строку показываем как есть.
 function uchastokLabel(u) {
   const p = String(u || '').split('/')
   return p.length >= 4 ? `участок ${p[2]}, могила ${p[3]}` : String(u || '')
@@ -293,10 +303,16 @@ const GRAVE_MAX = 8
 function graveRow(r, full) {
   const names = graveNames(r).slice(0, full ? 4 : 2).map((x) => `   ${htmlEscape(x)}`)
   const links = graveLinks(r, full)
+  // Координаты — то, ради чего это ищут: по ним едут на место. Показываем текстом,
+  // а не только ссылкой: ссылку не перешлёшь мастеру в чужой мессенджер.
+  const coords = r.lat && full ? `\n   <code>${r.lat}, ${r.lon}</code>` : ''
   return `📍 <b>${htmlEscape(uchastokLabel(r.uchastok))}</b>  <code>${htmlEscape(r.uchastok)}</code>` +
+    (full && r.cemetery ? `\n   ${htmlEscape(r.cemetery)}` : '') +
     (names.length ? `\n${names.join('\n')}` : '') +
     ((r.why || []).length ? `\n   ✅ ${htmlEscape(r.why.join(' · '))}` : '') +
-    (links.length ? `\n   ${links.join(' · ')}` : '')
+    coords +
+    (links.length ? `\n   ${links.join(' · ')}` : '') +
+    (full && REGISTRY_NAME[r.source] ? `\n   <i>источник: ${REGISTRY_NAME[r.source]}</i>` : '')
 }
 
 // Строка списка: номер, участок, кто лежит. Раскрывается кнопкой с тем же номером.
@@ -321,10 +337,18 @@ function graveOwnerText(g, origin = 'по сообщению клиента') {
   const best = shown[0]
   const sure = (best.score || 0) > 0
   const head = `🔎 <b>${htmlEscape(g.cemetery || 'Реестр захоронений')}</b> · <i>${htmlEscape(origin)}</i>` +
-    // Реестр ищет по точному вхождению: по полному ФИО бывает пусто, а по фамилии
-    // на том же кладбище — есть. Молча выдать это за найденную могилу нельзя.
-    (g.relaxed
-      ? `\n⚠️ <i>По «${htmlEscape(g.fio)}» в реестре пусто. Это совпадения по «${htmlEscape(g.relaxed)}» — однофамильцы, а не та же могила.</i>`
+    // Поиск идёт ступенями: полное ФИО → фамилия → маска (в реестре фамилию могли
+    // записать с другой буквой) → годы без фамилии. Ступень, на которой нашлось,
+    // меняет смысл результата: однофамилец и «совпадение по датам» — не та могила.
+    // Молча выдать это за найденную — худшее, что может сделать бот.
+    (g.via_text
+      ? `\n⚠️ <i>Найдено ${htmlEscape(g.via_text)}.</i>`
+      : (g.relaxed
+        ? `\n⚠️ <i>По «${htmlEscape(g.fio)}» в реестре пусто. Это совпадения по «${htmlEscape(g.relaxed)}» — однофамильцы, а не та же могила.</i>`
+        : '')) +
+    // Реестр не ответил — это «не искали», а не «не нашли». Разница видна только здесь.
+    (g.registry_errors && Object.keys(g.registry_errors).length
+      ? `\n⚠️ <i>Не ответил ${Object.keys(g.registry_errors).map((k) => REGISTRY_NAME[k] || k).join(', ')} — там могло быть ещё.</i>`
       : '')
   const rest = shown.slice(1)
   const restBlock = rest.length
