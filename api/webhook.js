@@ -87,6 +87,32 @@ async function crmIngest(payload) {
   }
 }
 
+// Новый заказ из пересланного владельцем сообщения. Отдельная ручка, а не /api/ingest:
+// там ключ склейки — чат клиента, которого при пересылке нет. Альбом (media_group_id)
+// прилетает несколькими вызовами Vercel — склейку в одну карточку делает CRM (единый
+// процесс), вебхук лишь помечает каждое фото группой. created=true придёт только тому
+// вызову, что реально создал карточку, — по нему и шлём ссылку, иначе на альбом из 5 фото
+// прилетело бы 5 ссылок.
+async function crmCreateOrder(payload) {
+  if (!CRM_URL || !CRM_SECRET) return null
+  try {
+    const ctrl = new AbortController()
+    const kill = setTimeout(() => ctrl.abort(), 6000)
+    const r = await fetch(CRM_URL.replace(/\/+$/, '') + '/api/bot/order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CRM-Secret': CRM_SECRET },
+      body: JSON.stringify(payload),
+      signal: ctrl.signal,
+    })
+    clearTimeout(kill)
+    if (!r.ok) { safeLog('crm.order=' + r.status, { status: r.status }); return null }
+    return await r.json()
+  } catch (e) {
+    safeLog('crm.order.fail', { error: String(e && e.message || e).slice(0, 120) })
+    return null
+  }
+}
+
 // Поиск захоронения и разбор выдачи — в api/_lib.js (crmGraveSearch/graveOwnerText):
 // тот же код нужен и вебхуку, и чату на сайте.
 
@@ -759,6 +785,53 @@ module.exports = async (req, res) => {
           reply_to_message_id: message.message_id,
         }, incomingBotToken)
       }
+    }
+    return res.status(200).send('OK')
+  }
+
+  // === OWNER: пересланное сообщение / фото / «/zakaz» → новый заказ в CRM ===
+  // Daniil переслал переписку из вацапа/MAX/TG (текст+фото) — заводим карточку заказа и
+  // отвечаем ссылкой #c<id>. Кладбище и вид работ CRM определит из текста сама. Триггеры:
+  //   • пересылка (forward_*) — основной, ловит и альбом (склейка по media_group_id в CRM);
+  //   • любое вложение вне ответа (одиночное фото или элемент альбома без подписи);
+  //   • «/zakaz …» — для текста, скопированного из вацапа (там метки пересылки нет).
+  // Гейт по OWNER_CHAT_ID, чтобы не менять поток Сергея. Reply-ветка уже вернула ответ
+  // выше — сюда доходит только не-ответ. Grave-поиск владельца остаётся на /mogila и на
+  // текстовой ветке ниже: простой текст (без пересылки/вложения/zakaz) сюда не попадает.
+  const isForward = !!(message.forward_origin || message.forward_from ||
+    message.forward_sender_name || message.forward_date)
+  const zakazText = /^\/zakaz(@\w+)?\b/i.test(text) ? text.replace(/^\/zakaz(@\w+)?\s*/i, '')
+    : /^\/zakaz(@\w+)?\b/i.test(caption) ? caption.replace(/^\/zakaz(@\w+)?\s*/i, '') : null
+  const orderAtt = (!message.reply_to_message) ? detectAttachment(message) : null
+  if (chatId === OWNER_CHAT_ID && !message.reply_to_message &&
+      (isForward || orderAtt || zakazText !== null) && CRM_URL && CRM_SECRET) {
+    const body = (zakazText !== null ? zakazText : (text || caption || '')).trim()
+    // Медиа кладём только у пересылаемых типов с file_id (фото/файл/видео/голос/аудио);
+    // у кружка/стикера/гео method=null — карточку заведём по тексту, вложение пропустим.
+    const mediaRef = orderAtt && orderAtt.method ? orderAtt.fileId : null
+    const created = await crmCreateOrder({
+      project_id: crmProject(incomingBot),
+      text: body,
+      media_group_id: message.media_group_id || null,
+      media_ref: mediaRef,
+      media_kind: orderAtt ? orderAtt.label : null,
+      tg_msg_id: message.message_id,
+      author_label: 'Переслал Daniil',
+      source: isForward ? 'forward' : zakazText !== null ? 'zakaz' : 'forward',
+    })
+    if (created && created.created && created.client_id) {
+      const link = CRM_URL.replace(/\/+$/, '') + '/#c' + created.client_id
+      await sendMessage(chatId,
+        `🗂 <b>Заказ создан</b> — <a href="${link}">#${created.client_id} в CRM</a>\n\n` +
+        'Кладбище и вид работ определятся из текста, фото уже в карточке. ' +
+        'Ссылку можно переслать мастеру. Поиск могилы по этому заказу — <code>/mogila Фамилия, кладбище</code>.',
+        { disable_web_page_preview: true }, incomingBotToken)
+    } else if (!created) {
+      // Только когда карточку реально не завели. Для второго+ фото альбома created=false —
+      // это не ошибка, молчим (карточка уже есть, фото добавилось).
+      await sendMessage(chatId,
+        '⚠️ CRM не приняла заказ — карточка не создана. Проверь CRM или повтори.',
+        {}, incomingBotToken)
     }
     return res.status(200).send('OK')
   }
