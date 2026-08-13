@@ -11,7 +11,7 @@
 //   6. Notify owner в TG (sendPhoto с публичным URL + chat session context)
 //   7. Return public URL — виджет уже видит свою картинку в чате
 
-const { isValidUuid, fetchWithTimeout, safeLog } = require('./_lib')
+const { isValidUuid, fetchWithTimeout, safeLog, chatStore } = require('./_lib')
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fxxmhnmvttvfatdlxpxk.supabase.co'
 const SUPABASE_SECRET = process.env.SUPABASE_SECRET_KEY
@@ -225,6 +225,23 @@ module.exports = async (req, res) => {
         media_type: 'photo',
       },
     )
+
+    // Сохраняем фото в основную CRM (Python/SQLite) — Supabase выше это зеркало
+    // chat-send.js делает то же самое через chatStore.message() для текста;
+    // здесь это пропускалось, и фото не появлялось в карточке клиента.
+    try {
+      await chatStore.message({
+        session_id: session.id,
+        role: 'user',
+        text: trimmedCaption,
+        media_kind: 'photo',
+        media_ref: publicUrl,
+        tg_msg_id: null,
+      })
+    } catch (e) {
+      safeLog('crm.photo.message.fail', { error: e.message })
+      // Не падаем: CRM недостатчна — фото всё равно ушло клиенту и в Supabase
+    }
 
     // Уведомляем владельца в TG (это «тихая» эскалация если её ещё не было)
     // Site выводим либо из source_url сессии, либо из текущего Origin.
