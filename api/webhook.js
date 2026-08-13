@@ -7,9 +7,14 @@ const {
 } = require('./_lib')
 
 const OWNER_CHAT_ID = parseInt(process.env.OWNER_CHAT_ID || '696698928', 10)
+// Второй аккаунт Daniil (@danil_msk_02) — полноправный владелец uhod-бота: заводит заказы,
+// ищет могилы, отвечает клиентам. Список через env, дефолт = его id.
+const EXTRA_OWNER_IDS = (process.env.EXTRA_OWNER_IDS || '5783316378')
+  .split(',').map(s => parseInt(s.trim(), 10)).filter(Boolean)
+const DANIIL_IDS = [OWNER_CHAT_ID, ...EXTRA_OWNER_IDS]   // все аккаунты Daniil (ветка заказа — только они, без Сергея)
 const KMH_EXTRA_OWNER_IDS = (process.env.KMH_EXTRA_OWNER_IDS || '1650405909')
   .split(',').map(s => parseInt(s.trim(), 10)).filter(Boolean)
-const ALL_OWNER_IDS = new Set([OWNER_CHAT_ID, ...KMH_EXTRA_OWNER_IDS])
+const ALL_OWNER_IDS = new Set([OWNER_CHAT_ID, ...EXTRA_OWNER_IDS, ...KMH_EXTRA_OWNER_IDS])
 const BOT_TOKEN = process.env.BOT_TOKEN                         // @uhodmogil_bot
 const BOT_TOKEN_KMH = process.env.BOT_TOKEN_KMH                 // @KissMyHandsBot
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fxxmhnmvttvfatdlxpxk.supabase.co'
@@ -803,7 +808,7 @@ module.exports = async (req, res) => {
   const zakazText = /^\/zakaz(@\w+)?\b/i.test(text) ? text.replace(/^\/zakaz(@\w+)?\s*/i, '')
     : /^\/zakaz(@\w+)?\b/i.test(caption) ? caption.replace(/^\/zakaz(@\w+)?\s*/i, '') : null
   const orderAtt = (!message.reply_to_message) ? detectAttachment(message) : null
-  if (chatId === OWNER_CHAT_ID && !message.reply_to_message &&
+  if (DANIIL_IDS.includes(chatId) && !message.reply_to_message &&
       (isForward || orderAtt || zakazText !== null) && CRM_URL && CRM_SECRET) {
     const body = (zakazText !== null ? zakazText : (text || caption || '')).trim()
     // Медиа кладём только у пересылаемых типов с file_id (фото/файл/видео/голос/аудио);
