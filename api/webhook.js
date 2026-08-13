@@ -880,7 +880,10 @@ module.exports = async (req, res) => {
   }
 
   // === CUSTOMER MESSAGE in direct TG ===
-  if (chatId !== OWNER_CHAT_ID) {
+  // Гейт по ВСЕМ владельцам, а не только основному: со вторым аккаунтом Daniil
+  // (@danil_msk_02) или Сергеем (KMH) обычное сообщение владельца иначе заводит
+  // ложную клиентскую карточку и шлёт «лид» самому себе.
+  if (!ALL_OWNER_IDS.has(chatId)) {
     if (text === '/start') {
       if (incomingBot === 'kmh') {
         await sendMessage(chatId,
