@@ -15,6 +15,11 @@ const DANIIL_IDS = [OWNER_CHAT_ID, ...EXTRA_OWNER_IDS]   // все аккаун�
 const KMH_EXTRA_OWNER_IDS = (process.env.KMH_EXTRA_OWNER_IDS || '1650405909')
   .split(',').map(s => parseInt(s.trim(), 10)).filter(Boolean)
 const ALL_OWNER_IDS = new Set([OWNER_CHAT_ID, ...EXTRA_OWNER_IDS, ...KMH_EXTRA_OWNER_IDS])
+// Мастера — не клиенты и не владельцы. Без этого списка первый же /start от мастера
+// заводил на него клиентскую карточку («Открыл бота»), а followup потом напоминал
+// владельцу про «чат без ответа». Дефолт = Алексей Рузин (учётка «Мастер (бригада)»).
+const STAFF_IDS = new Set((process.env.STAFF_IDS || '1066520321')
+  .split(',').map(s => parseInt(s.trim(), 10)).filter(Boolean))
 const BOT_TOKEN = process.env.BOT_TOKEN                         // @uhodmogil_bot
 const BOT_TOKEN_KMH = process.env.BOT_TOKEN_KMH                 // @KissMyHandsBot
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fxxmhnmvttvfatdlxpxk.supabase.co'
@@ -73,6 +78,24 @@ async function broadcastToOtherOwners(text, fromChatId, botToken) {
 // (сначала CRM, потом уведомление) означал бы, что падение CRM = молча потерянный лид.
 const CRM_URL = process.env.CRM_URL || ''
 const CRM_SECRET = process.env.CRM_SECRET || ''
+
+// Личная ссылка мастера в CRM: логинит под его учёткой (сопоставление по tg_id на стороне
+// CRM). Кука не выживает во встроенном браузере телеграма — поэтому ключ в адресе.
+async function crmStaffLink(tgId) {
+  if (!CRM_URL || !CRM_SECRET) return null
+  try {
+    const r = await fetch(CRM_URL.replace(/\/+$/, '') + '/api/bot/sessionlink?tg=' + tgId, {
+      headers: { 'X-CRM-Secret': CRM_SECRET },
+      signal: AbortSignal.timeout(6000),
+    })
+    if (!r.ok) return null
+    const j = await r.json()
+    return (j && j.url) || null
+  } catch (e) {
+    safeLog('crm.stafflink.fail', { error: String(e && e.message || e).slice(0, 120) })
+    return null
+  }
+}
 
 async function crmIngest(payload) {
   if (!CRM_URL || !CRM_SECRET) return
@@ -884,6 +907,20 @@ module.exports = async (req, res) => {
   // (@danil_msk_02) или Сергеем (KMH) обычное сообщение владельца иначе заводит
   // ложную клиентскую карточку и шлёт «лид» самому себе.
   if (!ALL_OWNER_IDS.has(chatId)) {
+    // Мастер: ни карточки, ни «нового лида» владельцу. На любое его сообщение отвечаем
+    // личной ссылкой в CRM — дальше он работает там, а сюда получает уведомления.
+    if (STAFF_IDS.has(chatId) && incomingBot !== 'kmh') {
+      const staffLink = await crmStaffLink(chatId)
+      await sendMessage(chatId,
+        '🔑 <b>Вы вошли как мастер УходМогил</b>\n\n' +
+        (staffLink
+          ? `Ваш вход в CRM без пароля:\n${staffLink}\n\n`
+          : 'Ссылку на CRM пришлёт владелец.\n\n') +
+        'Сюда будут приходить новые заявки. Ссылки из уведомлений открывают CRM сразу под вашей учёткой.',
+        { disable_web_page_preview: true }, incomingBotToken,
+      )
+      return res.status(200).send('OK')
+    }
     if (text === '/start') {
       if (incomingBot === 'kmh') {
         await sendMessage(chatId,
