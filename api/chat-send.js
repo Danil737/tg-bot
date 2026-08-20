@@ -17,7 +17,20 @@ const {
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fxxmhnmvttvfatdlxpxk.supabase.co'
 const SUPABASE_SECRET = process.env.SUPABASE_SECRET_KEY
 const GROQ_API_KEY = process.env.GROQ_API_KEY
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile'
+// Модели по порядку: отвечает первая рабочая, остальные — страховка.
+//
+// 20.08.2026 чат эскалировал КАЖДОЕ сообщение, потому что Groq снял
+// llama-3.3-70b-versatile: вызов падал с model_not_found, срабатывал аварийный откат,
+// и снаружи это выглядело как «ИИ сам решил позвать менеджера». Одна модель в конфиге —
+// единая точка отказа, поэтому теперь их список.
+//
+// Кандидаты проверены живыми запросами 20.08 (с US-бокса: из РФ и КЗ Groq закрыт):
+//   gpt-oss-120b / gpt-oss-20b — отвечают по-русски и выдают ТОЧНУЮ фразу эскалации;
+//   qwen/qwen3.6-27b — протекает блоком <think>, непригодна;
+//   groq/compound-mini — по-русски пишет хорошо, но фразу эскалации не выдаёт, то есть
+//   заявка молча не дошла бы до владельца. Не берём намеренно.
+const GROQ_MODELS = (process.env.GROQ_MODEL || 'openai/gpt-oss-120b,openai/gpt-oss-20b')
+  .split(',').map((s) => s.trim()).filter(Boolean)
 const BOT_TOKEN = process.env.BOT_TOKEN                      // @uhodmogil_bot
 const BOT_TOKEN_KMH = process.env.BOT_TOKEN_KMH              // @KissMyHandsBot
 const OWNER_CHAT_ID = parseInt(process.env.OWNER_CHAT_ID || '696698928', 10)  // Daniil — primary
@@ -213,54 +226,65 @@ async function aiReply(history, userMessage, sourceUrl) {
   }
   messages.push({ role: 'user', content: userMessage })
 
-  const body = {
-    model: GROQ_MODEL,
-    messages,
-    temperature: 0.2,
-    max_tokens: 300,
-    top_p: 0.9,
-  }
-
-  // Retry with jitter: base delays + random ±200ms. Without jitter, all
-  // instances retry in lockstep on 429 → thundering herd.
-  const delays = [0, 600, 1500]
   let lastErr = null
-  for (const baseDelay of delays) {
-    const jitter = Math.floor((Math.random() - 0.5) * 400)
-    const delay = Math.max(0, baseDelay + jitter)
-    if (delay) await new Promise((r) => setTimeout(r, delay))
-    try {
-      const r = await fetchWithTimeout(
-        'https://api.groq.com/openai/v1/chat/completions',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${GROQ_API_KEY}`,
-          },
-          body: JSON.stringify(body),
-        },
-        8000,
-      )
-      const data = await r.json()
-      if (!r.ok) {
-        console.error(`Groq ${r.status} (delay=${delay})`, JSON.stringify(data).slice(0, 300))
-        if (r.status >= 400 && r.status < 500 && r.status !== 429) {
-          throw new Error(`Groq ${r.status} (no retry)`)
-        }
-        lastErr = new Error(`Groq ${r.status}`)
-        continue
-      }
-      const text = data?.choices?.[0]?.message?.content?.trim()
-      if (!text) {
-        lastErr = new Error('Groq: empty response')
-        continue
-      }
-      return text
-    } catch (err) {
-      lastErr = err
-      console.error(`Groq fetch err (delay=${delay}):`, err.message)
+  for (const model of GROQ_MODELS) {
+    const body = {
+      model,
+      messages,
+      temperature: 0.2,
+      max_tokens: 300,
+      top_p: 0.9,
     }
+    // Без reasoning_effort семейство gpt-oss кладёт ответ в поле рассуждений,
+    // а content возвращает пустым — снаружи это неотличимо от «модель молчит».
+    if (model.startsWith('openai/gpt-oss')) body.reasoning_effort = 'low'
+
+    // Retry with jitter: base delays + random ±200ms. Without jitter, all
+    // instances retry in lockstep on 429 → thundering herd.
+    const delays = [0, 600, 1500]
+    let modelDead = false
+    for (const baseDelay of delays) {
+      const jitter = Math.floor((Math.random() - 0.5) * 400)
+      const delay = Math.max(0, baseDelay + jitter)
+      if (delay) await new Promise((r) => setTimeout(r, delay))
+      try {
+        const r = await fetchWithTimeout(
+          'https://api.groq.com/openai/v1/chat/completions',
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${GROQ_API_KEY}`,
+            },
+            body: JSON.stringify(body),
+          },
+          8000,
+        )
+        const data = await r.json()
+        if (!r.ok) {
+          console.error(`Groq ${r.status} ${model} (delay=${delay})`, JSON.stringify(data).slice(0, 300))
+          if (r.status >= 400 && r.status < 500 && r.status !== 429) {
+            // Модель снята или ключ к ней не пускает — ретраить бессмысленно,
+            // идём к следующей. Раньше здесь был throw, и список бы не помог.
+            lastErr = new Error(`Groq ${r.status} (${model})`)
+            modelDead = true
+            break
+          }
+          lastErr = new Error(`Groq ${r.status} (${model})`)
+          continue
+        }
+        const text = data?.choices?.[0]?.message?.content?.trim()
+        if (!text) {
+          lastErr = new Error(`Groq: empty response (${model})`)
+          continue
+        }
+        return text
+      } catch (err) {
+        lastErr = err
+        console.error(`Groq fetch err ${model} (delay=${delay}):`, err.message)
+      }
+    }
+    if (modelDead) continue
   }
   throw lastErr || new Error('Groq: all retries failed')
 }
