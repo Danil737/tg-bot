@@ -193,13 +193,20 @@ async function setSessionEscalated(sessionId, tgRootMessageId) {
 }
 
 async function aiReply(history, userMessage, sourceUrl) {
+  // Страница входа идёт в системный промпт отдельной строкой.
+  //
+  // ⚠️ Здесь была потеряна обратная кавычка шаблонной строки, и файл перестал быть
+  // корректным JS. Сборка Vercel этого НЕ ловит (функции не компилируются),
+  // поэтому деплой был зелёным, а чат отвечал 500 на ЛЮБОЙ запрос с 15.08 по 20.08.
+  // Перед пушем в этот репозиторий: node --check api/*.js
   let systemContent = SYSTEM_PROMPT
   if (sourceUrl) {
-    systemContent += 
+    systemContent += `
 
-[Клиент зашёл со страницы:  + sourceUrl + ]
+[Клиент зашёл со страницы: ${sourceUrl}]`
   }
-  const messages = [{ role: 'system', content: SYSTEM_PROMPT }]
+  // Берём именно systemContent: с SYSTEM_PROMPT адрес страницы до модели не доезжал бы.
+  const messages = [{ role: 'system', content: systemContent }]
   for (const m of history) {
     if (m.role === 'user') messages.push({ role: 'user', content: m.content })
     else if (m.role === 'ai') messages.push({ role: 'assistant', content: m.content })
