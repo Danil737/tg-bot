@@ -24,6 +24,11 @@ const MEMORIAL_GROUPS = [
     events: [{ isoDate: '2026-08-28', name: 'Успение Пресвятой Богородицы' }],
     landingPath: '/seasonalniy/uborka-mogily-pered-uspeniem',
     daysBeforeFirst: 10,
+    // Окно этой кампании (18.08) прошло ДО подключения Resend — тогда сработала
+    // аварийная TG-ветка, письма не отправлялись. Без этого флага расширение условия
+    // до окна отправило бы её задним числом на следующем же прогоне. Снять флаг,
+    // если рассылку по Успению всё-таки решат отправить.
+    skip: true,
     body: 'Через {N} дней — Успение Богородицы 28 августа 2026. Один из двенадцати главных православных праздников, традиционное время осеннего посещения могил.',
   },
   {
@@ -186,7 +191,12 @@ module.exports = async (req, res) => {
       const target = new Date(firstEvent.isoDate + 'T08:00:00+03:00')
       target.setHours(0, 0, 0, 0)
       const daysLeft = Math.ceil((target.getTime() - today.getTime()) / (1000 * 60 * 60 * 24))
-      if (daysLeft === group.daysBeforeFirst) {
+      // Окно, а не один календарный день. С `===` кампания уходила ровно в одну дату,
+      // и сутки простоя таймера (или сетевой флап KZ) убивали её целиком. Повтор при
+      // этом не грозит: ниже стоит проверка email_queue по campaign_key.
+      // Нижняя граница обязательна — без неё письмо «через N дней» ушло бы и ПОСЛЕ
+      // праздника, когда daysLeft уже отрицательный.
+      if (!group.skip && daysLeft >= 0 && daysLeft <= group.daysBeforeFirst) {
         upcoming.push({ group, daysLeft })
       }
     }
@@ -221,6 +231,18 @@ module.exports = async (req, res) => {
           `<b>Тема:</b> ${htmlEsc(subject)}\n\n` +
           `Добавь RESEND_API_KEY в Vercel env → рассылка пойдёт сама.`
         )
+        // Метка в очередь — иначе кампания, обработанная этой веткой, считается
+        // неотправленной, и как только появится RESEND_API_KEY, она уйдёт письмами
+        // задним числом. Именно так и вышло с Успением-2026.
+        await sb('email_queue', 'POST', [{
+          recipient_email: 'tg-fallback@uhod-mogil.ru',
+          subject: `[TG fallback] ${group.title}`,
+          body_html: '',
+          campaign_key: group.key,
+          sent_at: null,
+          send_error: 'RESEND_API_KEY не задан — владелец уведомлён в Telegram',
+          attempts: 0,
+        }]).catch(e => console.error('fallback queue mark error:', e.message))
         results.push({ group: group.key, action: 'tg-notified', subscriberCount: total })
         continue
       }
