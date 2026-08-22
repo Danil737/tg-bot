@@ -376,7 +376,81 @@ ${closing}
     }
     if (modelDead) continue
   }
-  throw lastErr || new Error('Groq: all retries failed')
+
+  // ── Groq не смог. Идём по запасным провайдерам, а НЕ в эскалацию.
+  //
+  // 22.08.2026: Groq free-tier упирается в суточный лимит токенов (TPD 200k на всю
+  // организацию), и тогда каждому клиенту вместо ответа уходило «✓ Передаю менеджеру».
+  //   429 Rate limit reached ... on tokens per day (TPD): Limit 200000, Used 198001
+  // Лимит выжигала в том числе собственная проба сторожа (144 вызова/сутки × ~2100
+  // токенов = 151% суточной квоты). Одного ключа мало: квота считается на организацию,
+  // поэтому кроме отдельного ключа нужен и запасной провайдер.
+  //
+  // Требование владельца дословно: «сообщение от клиента обязано дойти в любом случае
+  // и пофигу мне на лимиты». Поэтому эскалация — только когда легли ВСЕ провайдеры.
+  for (const [name, fn] of [['cloudflare', cfReply], ['gemini', geminiReply]]) {
+    try {
+      const text = await fn(messages)
+      if (text) {
+        console.error(`Groq недоступен (${lastErr && lastErr.message}), ответил ${name}`)
+        return text
+      }
+      console.error(`fallback ${name}: пустой ответ`)
+    } catch (err) {
+      console.error(`fallback ${name} failed:`, err.message)
+      lastErr = err
+    }
+  }
+  throw lastErr || new Error('Все LLM-провайдеры недоступны')
+}
+
+// ── Запасные провайдеры чата ────────────────────────────────────────────────────
+// Оба выбраны потому, что доступны из рантайма Vercel (США) без прокси и имеют
+// бесплатный тир с лимитами, независимыми от Groq.
+
+async function cfReply(messages) {
+  const acc = process.env.CF_ACCOUNT_ID
+  const tok = process.env.CF_AI_TOKEN
+  if (!acc || !tok) return ''
+  const r = await fetchWithTimeout(
+    `https://api.cloudflare.com/client/v4/accounts/${acc}/ai/run/@cf/meta/llama-3.3-70b-instruct-fp8-fast`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` },
+      body: JSON.stringify({ messages, max_tokens: 400, temperature: 0.2 }),
+    },
+    12000,
+  )
+  const d = await r.json()
+  if (!r.ok) throw new Error(`Cloudflare ${r.status} ${JSON.stringify(d).slice(0, 160)}`)
+  return String(d?.result?.response || '').trim()
+}
+
+async function geminiReply(messages) {
+  const key = process.env.GEMINI_API_KEY
+  if (!key) return ''
+  // У Gemini системная инструкция отдельным полем, а роль ассистента зовётся model.
+  const sys = messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n')
+  const contents = messages
+    .filter((m) => m.role !== 'system')
+    .map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }))
+  const r = await fetchWithTimeout(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${key}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: sys }] },
+        contents,
+        generationConfig: { temperature: 0.2, maxOutputTokens: 400 },
+      }),
+    },
+    12000,
+  )
+  const d = await r.json()
+  if (!r.ok) throw new Error(`Gemini ${r.status} ${JSON.stringify(d).slice(0, 160)}`)
+  const parts = d?.candidates?.[0]?.content?.parts || []
+  return parts.map((p) => p.text || '').join('').trim()
 }
 
 function escapeMd(s) {
@@ -521,6 +595,33 @@ module.exports = async (req, res) => {
   setCors(req, res)
   if (req.method === 'OPTIONS') return res.status(204).end()
   if (req.method !== 'POST') return res.status(405).json({ ok: false, error: 'Method not allowed' })
+
+  // ── Синтетическая проба сторожа: прогоняем ТОЛЬКО путь ИИ и сразу уходим.
+  // Ни сессии, ни карточки в CRM, ни уведомления владельцу.
+  //
+  // 22.08.2026: проба ходила обычным клиентским путём, поэтому при отказе ИИ включалась
+  // штатная эскалация — карточки «Заявка #647-650 / Здравствуйте! / не отвечали» в CRM и
+  // «🆕 НОВЫЙ ЧАТ» в телеграм каждые 10 минут. Уборка в chat_watch подметала карточки лишь
+  // на следующем тике таймера, а телеграм-сообщения не отзываются вообще.
+  // Правило: автопроверка обязана быть невидимой и для владельца, и для рабочих данных.
+  //
+  // Секрет в заголовке, а не в параметре URL: параметр может подобрать посторонний и
+  // глушить уведомления по чужим обращениям.
+  const probeSecret = process.env.CHAT_PROBE_SECRET
+  if (probeSecret && req.headers['x-chat-probe'] === probeSecret) {
+    const probeMsg = String((req.body && req.body.message) || 'Здравствуйте!').slice(0, 500)
+    try {
+      const text = await aiReply([], probeMsg, (req.body && req.body.sourceUrl) || '')
+      return res.status(200).json({ ok: true, probe: true, aiReply: text })
+    } catch (err) {
+      // Отдаём 200 с пустым ответом: сторож сам решит, что это поломка. Так он видит
+      // разницу между «ИИ не ответил» и «эндпоинт недоступен».
+      return res.status(200).json({
+        ok: true, probe: true, aiReply: '',
+        probeError: String((err && err.message) || err).slice(0, 200),
+      })
+    }
+  }
 
   try {
     const { sessionId: incomingSessionId, token: incomingToken, message, sourceUrl, userAgent, attribution } = req.body || {}
