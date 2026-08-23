@@ -468,8 +468,21 @@ function dropRepeats(text, history) {
   return out.length >= 15 ? out : text
 }
 
+// Приветствие тоже не держится промптом: замер на шести первых сообщениях дал
+// 4 из 6. Человек пишет про могилу близкого, и ответ без «здравствуйте» читается
+// как автомат — поэтому первое наше сообщение в диалоге здоровается всегда.
+function ensureGreeting(text, history) {
+  const weSpoke = (history || []).some((m) => m && m.role === 'ai')
+  if (weSpoke) return text
+  const t = String(text || '').trim()
+  if (!t) return text
+  if (/^(здравствуйте|добрый (день|вечер|утро)|доброе утро|приветствую)/i.test(t)) return t
+  return 'Здравствуйте! ' + t
+}
+
 async function aiReply(history, userMessage, sourceUrl) {
-  return dropRepeats(await aiReplyRaw(history, userMessage, sourceUrl), history)
+  const raw = await aiReplyRaw(history, userMessage, sourceUrl)
+  return ensureGreeting(dropRepeats(raw, history), history)
 }
 
 

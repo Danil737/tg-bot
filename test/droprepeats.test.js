@@ -11,7 +11,8 @@ const grab = (name) => {
     else if (src[k] === '}') { d--; if (!d) return src.slice(i, k + 1) }
   }
 }
-eval(['normWords', 'splitSentences', 'tooSimilar', 'dropRepeats'].map(grab).join('\n'))
+eval(['normWords', 'splitSentences', 'tooSimilar', 'dropRepeats', 'ensureGreeting']
+  .map(grab).join('\n'))
 
 const PHOTO = 'Пришлите фото ограды и участка целиком — менеджер посмотрит и назовёт точную сумму.'
 const cases = [
@@ -52,5 +53,31 @@ for (const c of cases) {
   console.log((ok ? '  OK   ' : '  ПРОВАЛ ') + c.name)
   if (!ok) console.log('        получили: ' + out)
 }
-console.log('\nпройдено ' + (cases.length - bad) + ' из ' + cases.length)
+// ── Приветствие ──
+const greetCases = [
+  { name: 'первое сообщение без приветствия — дописываем',
+    hist: [], reply: 'Покраска ограды: зачистка, грунтовка и эмаль.',
+    want: (o) => o.startsWith('Здравствуйте! Покраска') },
+  { name: 'приветствие уже есть — не дублируем',
+    hist: [], reply: 'Здравствуйте! Уборка от 3 000 ₽.',
+    want: (o) => (o.match(/Здравствуйте/g) || []).length === 1 },
+  { name: '«Добрый день» тоже считается приветствием',
+    hist: [], reply: 'Добрый день! Чем помочь?',
+    want: (o) => !o.startsWith('Здравствуйте') },
+  { name: 'во втором нашем сообщении не здороваемся',
+    hist: [{ role: 'ai', content: 'Здравствуйте! Уборка от 3 000 ₽.' }],
+    reply: 'Работаем на Бутовском.',
+    want: (o) => o === 'Работаем на Бутовском.' },
+  { name: 'реплика клиента не считается нашим сообщением',
+    hist: [{ role: 'user', content: 'привет' }], reply: 'Уборка от 3 000 ₽.',
+    want: (o) => o.startsWith('Здравствуйте!') },
+]
+for (const c of greetCases) {
+  const out = ensureGreeting(c.reply, c.hist)
+  const ok = c.want(out)
+  if (!ok) bad++
+  console.log((ok ? '  OK   ' : '  ПРОВАЛ ') + c.name)
+  if (!ok) console.log('        получили: ' + out)
+}
+console.log('\nвсего проверок ' + (cases.length + greetCases.length) + ', провалов ' + bad)
 process.exit(bad ? 1 : 0)
