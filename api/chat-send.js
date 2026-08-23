@@ -309,7 +309,7 @@ async function setSessionEscalated(sessionId, tgRootMessageId) {
     { status: 'escalated', tg_root_message_id: tgRootMessageId }))
 }
 
-async function aiReply(history, userMessage, sourceUrl) {
+async function aiReplyRaw(history, userMessage, sourceUrl) {
   // Страница входа идёт в системный промпт отдельной строкой.
   //
   // ⚠️ Здесь была потеряна обратная кавычка шаблонной строки, и файл перестал быть
@@ -424,6 +424,54 @@ ${closing}
   }
   throw lastErr || new Error('Все LLM-провайдеры недоступны')
 }
+
+// ── Срез повторов ───────────────────────────────────────────────────────────────
+//
+// Промптом это не удержалось. Прямой запрет «не повторяй просьбу о фото» снизил
+// совпадение второго ответа с первым с 74% до 59%, но строку «Пришлите фото ... —
+// менеджер посмотрит и назовёт точную сумму» модель всё равно приклеивала к ответу
+// на уточняющий вопрос. Клиенту это читается как «моё сообщение не прочитали».
+// Поэтому повтор режется детерминированно, уже после модели.
+function normWords(s) {
+  return String(s).toLowerCase().replace(/ё/g, 'е')
+    .replace(/[^0-9a-zа-я ]+/gi, ' ')
+    .split(/\s+/).filter((w) => w.length > 2)
+}
+
+function splitSentences(s) {
+  return String(s).split(/(?<=[.!?])\s+|\n+/).map((x) => x.trim()).filter(Boolean)
+}
+
+// Порог по НОВОМУ предложению: если почти все его слова уже звучали в одном
+// предложении раньше — это повтор, даже когда в конец дописали «и сроки».
+function tooSimilar(oldWords, newWords) {
+  if (!oldWords.length || !newWords.length) return false
+  const set = new Set(oldWords)
+  const hit = newWords.filter((w) => set.has(w)).length
+  return hit / newWords.length >= 0.8
+}
+
+function dropRepeats(text, history) {
+  const said = (history || [])
+    .filter((m) => m && m.role === 'ai')
+    .flatMap((m) => splitSentences(m.content))
+    .map(normWords)
+    .filter((w) => w.length >= 4)
+  if (!said.length) return text
+  const kept = splitSentences(text).filter((p) => {
+    const w = normWords(p)
+    if (w.length < 4) return true
+    return !said.some((old) => tooSimilar(old, w))
+  })
+  const out = kept.join(' ').replace(/\s{2,}/g, ' ').trim()
+  // Если резать нечего или вырезали всё — отдаём как было: пустой ответ хуже повтора.
+  return out.length >= 15 ? out : text
+}
+
+async function aiReply(history, userMessage, sourceUrl) {
+  return dropRepeats(await aiReplyRaw(history, userMessage, sourceUrl), history)
+}
+
 
 // ── Запасные провайдеры чата ────────────────────────────────────────────────────
 // Оба выбраны потому, что доступны из рантайма Vercel (США) без прокси и имеют
