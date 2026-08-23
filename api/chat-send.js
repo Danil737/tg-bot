@@ -628,8 +628,16 @@ module.exports = async (req, res) => {
   const probeSecret = process.env.CHAT_PROBE_SECRET
   if (probeSecret && req.headers['x-chat-probe'] === probeSecret) {
     const probeMsg = String((req.body && req.body.message) || 'Здравствуйте!').slice(0, 500)
+    // История передаётся прямо в теле и никуда не пишется: без неё проверялся только
+    // первый ответ, а жалобы были на второй — повтор гарантии и просьбы о контакте.
+    const probeHistory = Array.isArray(req.body && req.body.history)
+      ? req.body.history.slice(-8).map((m) => ({
+          role: m && m.role === 'ai' ? 'ai' : 'user',
+          content: String((m && m.content) || '').slice(0, 2000),
+        }))
+      : []
     try {
-      const text = await aiReply([], probeMsg, (req.body && req.body.sourceUrl) || '')
+      const text = await aiReply(probeHistory, probeMsg, (req.body && req.body.sourceUrl) || '')
       return res.status(200).json({ ok: true, probe: true, aiReply: text })
     } catch (err) {
       // Отдаём 200 с пустым ответом: сторож сам решит, что это поломка. Так он видит
