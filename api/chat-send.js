@@ -338,6 +338,7 @@ ${closing}
   messages.push({ role: 'user', content: userMessage })
 
   let lastErr = null
+  const errs = []
   const startedAt = Date.now()
   for (const model of GROQ_MODELS) {
     const body = {
@@ -398,6 +399,7 @@ ${closing}
     }
     if (modelDead) continue
   }
+  if (lastErr) errs.push(`groq: ${lastErr.message.slice(0, 90)}`)
 
   // ── Groq не смог. Идём по запасным провайдерам, а НЕ в эскалацию.
   //
@@ -432,12 +434,16 @@ ${closing}
       } catch (err) {
         console.error(`fallback ${name} failed (попытка ${attempt + 1}):`, err.message)
         lastErr = err
+        errs.push(`${name}: ${err.message.slice(0, 90)}`)
         if (!/\b(429|500|502|503|504)\b/.test(err.message)) break
         if (Date.now() - startedAt > RETRY_UNTIL_MS) break
       }
     }
   }
-  throw lastErr || new Error('Все LLM-провайдеры недоступны')
+  // Сводка по ВСЕЙ цепочке, а не только по последнему звену: сторож показывал
+  // «Gemini 503», и по этому сообщению нельзя было понять, почему промолчали Groq
+  // и Cloudflare, — а корень отказа обычно именно в первом звене.
+  throw new Error(errs.length ? errs.join(' | ') : ((lastErr && lastErr.message) || 'Все LLM-провайдеры недоступны'))
 }
 
 // ── Срез повторов ───────────────────────────────────────────────────────────────
