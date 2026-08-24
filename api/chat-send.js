@@ -338,6 +338,7 @@ ${closing}
   messages.push({ role: 'user', content: userMessage })
 
   let lastErr = null
+  const startedAt = Date.now()
   for (const model of GROQ_MODELS) {
     const body = {
       model,
@@ -409,17 +410,31 @@ ${closing}
   //
   // Требование владельца дословно: «сообщение от клиента обязано дойти в любом случае
   // и пофигу мне на лимиты». Поэтому эскалация — только когда легли ВСЕ провайдеры.
+  // 24.08.2026: один ответ Gemini «503 experiencing high demand» — и клиент вместо
+  // ответа получал эскалацию, хотя минутой позже модель отвечала нормально. 429/5xx
+  // у бесплатных тиров означают «занято сейчас», а не «сломано», поэтому на них даём
+  // вторую попытку. Пустой ответ и 4xx (ключ/квота) ретраить бессмысленно — идём дальше.
+  //
+  // Ретрай ограничен бюджетом времени: у функции maxDuration 25с, и упереться в него
+  // хуже отказа — клиент получит 504 и вообще ничего, вместо «передаю менеджеру».
+  const RETRY_UNTIL_MS = 13000
   for (const [name, fn] of [['cloudflare', cfReply], ['gemini', geminiReply]]) {
-    try {
-      const text = await fn(messages)
-      if (text) {
-        console.error(`Groq недоступен (${lastErr && lastErr.message}), ответил ${name}`)
-        return text
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt) await new Promise((r) => setTimeout(r, 900))
+      try {
+        const text = await fn(messages)
+        if (text) {
+          console.error(`Groq недоступен (${lastErr && lastErr.message}), ответил ${name}`)
+          return text
+        }
+        console.error(`fallback ${name}: пустой ответ`)
+        break
+      } catch (err) {
+        console.error(`fallback ${name} failed (попытка ${attempt + 1}):`, err.message)
+        lastErr = err
+        if (!/\b(429|500|502|503|504)\b/.test(err.message)) break
+        if (Date.now() - startedAt > RETRY_UNTIL_MS) break
       }
-      console.error(`fallback ${name}: пустой ответ`)
-    } catch (err) {
-      console.error(`fallback ${name} failed:`, err.message)
-      lastErr = err
     }
   }
   throw lastErr || new Error('Все LLM-провайдеры недоступны')
